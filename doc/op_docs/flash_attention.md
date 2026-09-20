@@ -163,9 +163,14 @@ tecoopsFlashAttention参数信息
 
 ### 性能数据
 
-| 测试环境    | 测例                 | 硬件时间 (us) |
-| ----------- | -------------------- | ------------- |
-| CI 测试环境 | test_case_0.prototxt | 待补充        |
+| 测试环境 | 测例 | 配置与 Shape | 状态 |
+| --- | --- | --- | --- |
+| 太初 SDAA 3.2.0 | 0.prototxt | Q: [256, 32, 128], KV_cache: [8, 8, 32, 128] | OK |
+| 太初 SDAA 3.2.0 | 1.prototxt | Q: [256, 32, 128], KV_cache: [8, 8, 32, 128] | OK |
+| 太初 SDAA 3.2.0 | 2.prototxt | Q: [256, 32, 128], KV_cache: [8, 8, 32, 128] | OK |
+| 太初 SDAA 3.2.0 | 3.prototxt | Q: [256, 32, 128], KV_cache: [8, 8, 32, 128] | OK |
+| 太初 SDAA 3.2.0 | 4.prototxt | Q: [256, 32, 128], KV_cache: [8, 8, 32, 128] | OK |
+| 太初 SDAA 3.2.0 | 5.prototxt | Q: [256, 32, 128], KV_cache: [8, 8, 32, 128] | OK |
 
 ## 分支派发
 
