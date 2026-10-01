@@ -90,6 +90,9 @@ void rms_norm_torch(
     torch::Tensor output, c10::optional<torch::Tensor> residual_out,
     double eps) {
     tecoopsHandle_t handle = getGlobalHandle();
+    // Bind the handle to the caller's current SDAA stream so the fused
+    // normalization stays ordered with surrounding PyTorch work.
+    tecoopsSetStream(handle, torch::sdaa::getCurrentSDAAStream());
     int num_tokens = input.size(0);
     int hidden_size = input.size(1);
 
