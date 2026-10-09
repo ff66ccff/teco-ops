@@ -31,7 +31,6 @@
 #include <limits>
 #include <torch/extension.h>
 #include <c10/core/DeviceGuard.h>
-#include <limits>
 #include <vector>
 #include <torch_sdaa/sdaa_extension.h>
 
