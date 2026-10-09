@@ -10,8 +10,8 @@
 
 ## 1. What this branch consolidates
 
-Four merges onto `main`, in this order (each `--no-ff`, so all four branches become ancestors
-of `op/accepted-all` and a later re-merge of any of them is a no-op):
+Five merges onto `main`, in this order (each `--no-ff`, so every contributing branch becomes an
+ancestor of `op/accepted-all` and a later re-merge of any of them is a no-op):
 
 | # | Merged branch | Source sha | What it brings |
 | --- | --- | --- | --- |
@@ -19,15 +19,31 @@ of `op/accepted-all` and a later re-merge of any of them is a no-op):
 | 2 | `op/ms_deform_attn` | `d1a884b` | Deformable-DETR MSDA forward + first-order backward |
 | 3 | `op/rms-norm-epilogue-simd-dma` | `af57110` | RMSNorm second-pass SIMD epilogue + plain-DMA output overlap |
 | 4 | `op/reshape-and-cache-abi` | `d54a06f` | Non-contiguous reshape-and-cache ABI (see §3 — already in `main`) |
+| 5 | `op/flash-attention-d256-d512-tile` (again) | `795bfb8` | D512/BM32 `cur_BM`-scoped post-processing loops (+9 lines, `doc/op_docs/curbm-loops-note.md`) |
 
 Plus one follow-up commit that drops a duplicated `#include <limits>` left behind by the
 automatic merge of branch 2.
 
+### ⚠ Merge 5 exists because the source branch moved during this work
+
+`op/flash-attention-d256-d512-tile` was `3d6793a` when this task started (10:16 UTC,
+confirmed by `git ls-remote --heads`). At **10:24:49 UTC** another workstream pushed `795bfb8`
+onto it. It is **forward progress, not a force-push**: `git merge-base --is-ancestor 3d6793a
+795bfb8` is true. A consolidation has to reflect the source branch's *current* head, so merge 5
+folds it in. `teco/ual/kernel/flash_attention/flash_attention.scpp`
+in `op/accepted-all` is now blob `d542b9a33c031320c3202c5ba1a96f04fdc24bc1`, **byte-identical**
+to that branch's scpp (`git diff` between them is empty). Re-check the branch head before
+merging this into `main` — it may have moved again.
+
 ### Acceptance inventory (asserted on the final tree)
+
+The tree index used for this assertion **excludes `doc/op_docs/MERGE-NOTE-accepted-all.md`**
+(this file), because §3b below quotes the rejected hunks verbatim and would otherwise credit
+lines that exist in no source file.
 
 | Branch | distinct non-blank lines added vs `main` | present in final tree | dropped |
 | --- | ---: | ---: | ---: |
-| `op/flash-attention-d256-d512-tile` | 356 | **356** | 0 |
+| `op/flash-attention-d256-d512-tile` | 420 | **420** | 0 |
 | `op/ms_deform_attn` | 1869 | **1869** | 0 |
 | `op/rms-norm-epilogue-simd-dma` | 71 | **71** | 0 |
 | `op/reshape-and-cache-abi` | 34 | 15 | 19 (all superseded/regressive — §3) |
@@ -59,19 +75,36 @@ the old `i < size % 16` tail gone.
 
 ```
 source /opt/tecoai/setvars.sh
+rm -rf build api/tecoops/*.so          # clean, from scratch
 WITH_TORCH=ON WITH_INFERENCE_PLUGIN=OFF /home/py312/bin/python setup.py build_ext --inplace
 ```
 
-**Result: `rc=0`.** `libteco_ops.so built successfully!` and
-`api/tecoops/_torch_ext.cpython-312-loongarch64-linux-gnu.so` (11,316,296 B) plus
-`api/tecoops/libteco_ops.so` (364,856 B) were produced. `git status --short` is empty
-afterwards — build outputs are ignored.
+**Result: `rc=0`** on a build with `build/` and both `.so` files removed first.
+`libteco_ops.so built successfully!` and the torch extension compiled and linked.
 
-Warnings emitted, verbatim:
+Artifacts (sha256):
 
-- `Error in cpuinfo: processor architecture is not supported in cpuinfo` (import-time, pre-existing).
-- `torch_sdaa/utils/cpp_extension.py:198: UserWarning: torch_sdaa and extension build with different sdaa_runtime version`.
-- `-Wall` produced **no** compiler warnings for `api/torch_ext.cpp`.
+```
+cbb19129ee6df076687a17f32708fc35091816b8fc39e37eb05f266b983f51d9  api/tecoops/libteco_ops.so
+2961b5cc2df59a5ab6731564097f4420c12182e91a1652b845d05ff756471973  api/tecoops/_torch_ext.cpython-312-loongarch64-linux-gnu.so
+```
+
+`git status --short` is empty afterwards — build outputs are ignored.
+
+**Every** warning/error line in the whole log (3 lines, all pre-existing/environmental,
+verbatim):
+
+```
+Error in cpuinfo: processor architecture is not supported in cpuinfo
+/home/py312/lib/python3.12/site-packages/torch_sdaa/utils/cpp_extension.py:198: UserWarning: torch_sdaa and extension build with different sdaa_runtime version
+  warnings.warn('torch_sdaa and extension build with different sdaa_runtime version')
+```
+
+The `-Wall` compile of `api/torch_ext.cpp` (the merged file, 385 lines) produced **no**
+compiler diagnostics. The built library carries the new device stubs, e.g.
+`__device_stub__teco_slave_ms_deform_attn_forward_fp16/fp32`,
+`…_backward_fp16/fp32`, `…_backward_list_reduce_*`, `…_backward_list_producer_*`. This proves
+the sources compile and link; it says nothing about kernel correctness (see §5).
 
 ---
 
@@ -195,8 +228,9 @@ adds are present verbatim).
 | `test/zoo/teco/flash_attention/flash_attention.h` | 1 | consolidated side |
 | **total** | **58** | |
 
-The first three merges were auto-merged by the `ort` strategy with **zero** conflicts; only the
-unrelated-history merge produced conflicts (20 files, all add/add against an empty base).
+Merges 1–3 and 5 were auto-merged by the `ort` strategy with **zero** conflicts; only the
+unrelated-history merge 4 produced conflicts (20 files, all add/add against an empty base,
+58 conflict blocks).
 
 One cosmetic artifact: the auto-merge of `op/ms_deform_attn` kept **both** `#include <limits>`
 lines (one from the flash-attention branch, one from MSDA). The duplicate line is removed in a
