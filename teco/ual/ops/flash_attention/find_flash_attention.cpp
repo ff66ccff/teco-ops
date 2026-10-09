@@ -37,6 +37,12 @@ using tecoops::ual::args::FlashAttentionPatchArgs;
 
 
 int findFlashAttentionBranch(const FlashAttentionPatchArgs *args) {
+    if (args->rvargs->size_per_head == 256) {
+        return 1;
+    }
+    if (args->rvargs->size_per_head == 512) {
+        return 2;
+    }
     int algo = 0;
     // teco_slave_flash_attention_half
     return algo;
