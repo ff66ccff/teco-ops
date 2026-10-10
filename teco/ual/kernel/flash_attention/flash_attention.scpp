@@ -168,8 +168,17 @@ __device__ __always_inline void flash_attention_half(FlashAttentionArgs args) {
     if (tid >= MIN(args.spe_num, args.local_head_num * parts)) {
         return;
     }
-    int head = tid / parts;
-    int part = tid % parts;
+    // Partition mapping via head == tid % local_head_num, BM == 128 only (parts is capped at
+    // 2 there, so part == tid / local_head_num is 0 or 1).  With parts == 1 the guard above
+    // has already rejected every tid >= local_head_num, so this is exactly the previous
+    // head == tid / part == 0 mapping.
+    int head = tid;
+    int part = 0;
+    if constexpr (BM == 128) {
+        const int h = args.local_head_num;
+        part = tid / h;
+        head = tid - part * h;
+    }
     int num_kv_groups = args.local_head_num / args.local_kv_head_num;
 
     int BN = 32;    // N block, 32 for ace; block_size
