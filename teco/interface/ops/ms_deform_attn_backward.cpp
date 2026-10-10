@@ -98,7 +98,11 @@ tecoopsStatus_t tecoopsMsDeformAttnBackward(
     patch.atargs = &arg;
     patch.data_type = Convert::toUALDataType(data_type);
     patch.algo = Convert::toUALAlgoType(algo);
-    RUN_OP(MsDeformAttnBackwardZeroOp, arg, patch, handle);
+    // The output-owned specialization is the sole writer of every grad_value
+    // element, so the reset launch is only needed by the atomic scatter path.
+    if (!tecoops::ual::ops::msDeformAttnBackwardGradValueOwned(&patch)) {
+        RUN_OP(MsDeformAttnBackwardZeroOp, arg, patch, handle);
+    }
     RUN_OP(MsDeformAttnBackwardOp, arg, patch, handle);
     if (data_type == TECOOPS_DATA_HALF) {
         RUN_OP(MsDeformAttnBackwardCastOp, arg, patch, handle);

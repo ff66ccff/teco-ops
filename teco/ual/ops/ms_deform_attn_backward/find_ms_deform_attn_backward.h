@@ -36,6 +36,11 @@ namespace tecoops {
 namespace ual {
 namespace ops {
 
+// True when the fp32 branch is the sole writer of every grad_value element and
+// therefore does not need the paired reset kernel.
+bool msDeformAttnBackwardGradValueOwned(
+    const args::MsDeformAttnBackwardPatchArgs *arg);
+
 int findMsDeformAttnBackwardBranch(
     const args::MsDeformAttnBackwardPatchArgs *arg);
 
