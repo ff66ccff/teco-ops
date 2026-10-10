@@ -27,58 +27,20 @@
 // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-#ifndef ZOO_TECO_FLASH_ATTENTION_FLASH_ATTENTION_H_  // NOLINT
-#define ZOO_TECO_FLASH_ATTENTION_FLASH_ATTENTION_H_
+#ifndef TECOOPS_UAL_OPS_FIND_MS_DEFORM_ATTN_FORWARD_H_
+#define TECOOPS_UAL_OPS_FIND_MS_DEFORM_ATTN_FORWARD_H_
 
-#include <vector>
-#include "interface/include/tecoops.h"
-#include "zoo/teco/executor.h"
+#include "ual/args/ms_deform_attn_forward_args.h"
 
-namespace optest {
+namespace tecoops {
+namespace ual {
+namespace ops {
 
-class FlashAttentionExecutor : public TecoExecutor {
- public:
-    FlashAttentionExecutor() {}
-    ~FlashAttentionExecutor() {}
+int findMsDeformAttnForwardBranch(
+    const args::MsDeformAttnForwardPatchArgs *arg);
 
-    void paramCheck();
-    void paramParse();
-    void paramGeneration();
-    void compute();
-    void cpuCompute();
-    int64_t getTheoryOps() override;
-    int64_t getTheoryIoSize() override;
+}  // namespace ops
+}  // namespace ual
+}  // namespace tecoops
 
- private:
-    bool has_softmax_scale_ = false;
-    float softmax_scale_ = 0.0f;
-    int max_prefill_len_;
-    int max_decode_len_;
-    int batch_size_;
-    int total_q_tokens_;
-    int local_head_num_;
-    int local_kv_head_num_;
-    int size_per_head_;
-    int block_size_;
-    int block_table_dim_;
-    int max_block_num_;
-
-    tecoopsTensorDescriptor_t blockTableDesc_;
-    tecoopsTensorDescriptor_t qDataDesc_;
-    tecoopsTensorDescriptor_t kCacheDesc_;
-    tecoopsTensorDescriptor_t vCacheDesc_;
-    tecoopsTensorDescriptor_t oDataDesc_;
-
-    const void *blockTable_;
-    const void *qData_;
-    const void *kCache_;
-    const void *vCache_;
-    void *oData_;
-
-    std::vector<int> q_seq_lens_;
-    std::vector<int> kv_seq_lens_;
-};
-
-}  // namespace optest
-
-#endif  // ZOO_TECO_FLASH_ATTENTION_FLASH_ATTENTION_H_  // NOLINT
+#endif  // TECOOPS_UAL_OPS_FIND_MS_DEFORM_ATTN_FORWARD_H_

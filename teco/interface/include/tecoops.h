@@ -168,6 +168,22 @@ tecoopsStatus_t tecoopsFlashAttention(tecoopsHandle_t handle,
                                       const tecoopsTensorDescriptor_t oDataDesc,
                                       void *oData, void *workspace);
 
+// Explicit finite scale; the original entry keeps 1/sqrt(head_size).
+tecoopsStatus_t tecoopsFlashAttentionWithScale(tecoopsHandle_t handle,
+                                      int max_seqlen_q, int max_seqlen_k,
+                                      int max_block_num, float softmax_scale, const int *q_seq_lens,
+                                      const int *kv_seq_lens,
+                                      const tecoopsTensorDescriptor_t blockTableDesc,
+                                      const void *blockTable,
+                                      const tecoopsTensorDescriptor_t qDataDesc,
+                                      const void *qData,
+                                      const tecoopsTensorDescriptor_t kCacheDesc,
+                                      const void *kCache,
+                                      const tecoopsTensorDescriptor_t vCacheDesc,
+                                      const void *vCache,
+                                      const tecoopsTensorDescriptor_t oDataDesc,
+                                      void *oData, void *workspace);
+
 tecoopsStatus_t tecoopsCausalConv1d(tecoopsHandle_t handle,
                                     int batch,
                                     int totalSeqLen,
@@ -186,6 +202,64 @@ tecoopsStatus_t tecoopsCausalConv1d(tecoopsHandle_t handle,
                                     const int *queryStartLoc,
                                     const int *convStateIndices,
                                     const int8_t *hasInitialState);
+
+tecoopsStatus_t tecoopsMsDeformAttnForward(
+    tecoopsHandle_t handle,
+    const void *value,
+    const int64_t *spatial_shapes,
+    const void *sampling_locations,
+    const void *attention_weights,
+    void *output,
+    int batch,
+    int value_len,
+    int num_heads,
+    int head_dim,
+    int num_queries,
+    int num_levels,
+    int num_points,
+    tecoopsDataType_t data_type,
+    tecoopsAlgo_t algo);
+
+// grad_value is an FP32 device workspace for both input dtypes; this API resets it.
+// HALF requires a distinct, nonoverlapping grad_value_fp16 output; FLOAT may pass nullptr.
+// Native reset, accumulation and subnormal-preserving conversion use the same handle stream.
+tecoopsStatus_t tecoopsMsDeformAttnBackward(
+    tecoopsHandle_t handle,
+    const void *value,
+    const int64_t *spatial_shapes,
+    const void *sampling_locations,
+    const void *attention_weights,
+    const void *grad_output,
+    float *grad_value,
+    void *grad_value_fp16,
+    void *grad_locations,
+    void *grad_weights,
+    int batch, int value_len, int num_heads, int head_dim,
+    int num_queries, int num_levels, int num_points,
+    tecoopsDataType_t data_type, tecoopsAlgo_t algo);
+
+// List workspaces: value_heads int32[N*S*H], value_next int32[4*N*Q*H*L*P],
+// node_wx/node_wy FP32[4*N*Q*H*L*P]; both counts must fit INT32_MAX.
+// All workspace/output regions must be distinct and nonoverlapping, and must
+// remain alive until the handle stream completes. No caller initialization is needed.
+// Reduce writes every FP32 grad_value element, including empty-list zeros. HALF
+// requires a separate grad_value_fp16 output; conversion preserves subnormals.
+// List accumulation order is not deterministic; first-order gradients only.
+tecoopsStatus_t tecoopsMsDeformAttnBackwardList(
+    tecoopsHandle_t handle,
+    const void *value,
+    const int64_t *spatial_shapes,
+    const void *sampling_locations,
+    const void *attention_weights,
+    const void *grad_output,
+    float *grad_value,
+    void *grad_value_fp16,
+    void *grad_locations,
+    void *grad_weights,
+    int32_t *value_heads, int32_t *value_next, float *node_wx, float *node_wy,
+    int batch, int value_len, int num_heads, int head_dim,
+    int num_queries, int num_levels, int num_points,
+    tecoopsDataType_t data_type, tecoopsAlgo_t algo);
 
 #ifdef __cplusplus
 }

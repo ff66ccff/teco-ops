@@ -27,58 +27,26 @@
 // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-#ifndef ZOO_TECO_FLASH_ATTENTION_FLASH_ATTENTION_H_  // NOLINT
-#define ZOO_TECO_FLASH_ATTENTION_FLASH_ATTENTION_H_
+#ifndef TECOOPS_INTERFACE_COMMON_MS_DEFORM_ATTN_LIST_CAPACITY_H_
+#define TECOOPS_INTERFACE_COMMON_MS_DEFORM_ATTN_LIST_CAPACITY_H_
 
-#include <vector>
-#include "interface/include/tecoops.h"
-#include "zoo/teco/executor.h"
+#include <cstdint>
+#include <initializer_list>
+#include <limits>
 
-namespace optest {
+namespace tecoops {
+// Check before every multiplication: neither intermediate arithmetic nor node IDs overflow.
+inline bool msdaListCount(std::initializer_list<int64_t> factors, int64_t *count) {
+    int64_t result = 1;
+    for (const int64_t factor : factors) {
+        if (factor <= 0 || result > std::numeric_limits<int32_t>::max() / factor) {
+            return false;
+        }
+        result *= factor;
+    }
+    *count = result;
+    return true;
+}
+}  // namespace tecoops
 
-class FlashAttentionExecutor : public TecoExecutor {
- public:
-    FlashAttentionExecutor() {}
-    ~FlashAttentionExecutor() {}
-
-    void paramCheck();
-    void paramParse();
-    void paramGeneration();
-    void compute();
-    void cpuCompute();
-    int64_t getTheoryOps() override;
-    int64_t getTheoryIoSize() override;
-
- private:
-    bool has_softmax_scale_ = false;
-    float softmax_scale_ = 0.0f;
-    int max_prefill_len_;
-    int max_decode_len_;
-    int batch_size_;
-    int total_q_tokens_;
-    int local_head_num_;
-    int local_kv_head_num_;
-    int size_per_head_;
-    int block_size_;
-    int block_table_dim_;
-    int max_block_num_;
-
-    tecoopsTensorDescriptor_t blockTableDesc_;
-    tecoopsTensorDescriptor_t qDataDesc_;
-    tecoopsTensorDescriptor_t kCacheDesc_;
-    tecoopsTensorDescriptor_t vCacheDesc_;
-    tecoopsTensorDescriptor_t oDataDesc_;
-
-    const void *blockTable_;
-    const void *qData_;
-    const void *kCache_;
-    const void *vCache_;
-    void *oData_;
-
-    std::vector<int> q_seq_lens_;
-    std::vector<int> kv_seq_lens_;
-};
-
-}  // namespace optest
-
-#endif  // ZOO_TECO_FLASH_ATTENTION_FLASH_ATTENTION_H_  // NOLINT
+#endif  // TECOOPS_INTERFACE_COMMON_MS_DEFORM_ATTN_LIST_CAPACITY_H_

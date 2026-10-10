@@ -27,20 +27,15 @@
 // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-#ifndef ZOO_TECO_FLASH_ATTENTION_FLASH_ATTENTION_H_  // NOLINT
-#define ZOO_TECO_FLASH_ATTENTION_FLASH_ATTENTION_H_
-
-#include <vector>
-#include "interface/include/tecoops.h"
+#ifndef ZOO_TECO_MS_DEFORM_ATTN_BACKWARD_H_
+#define ZOO_TECO_MS_DEFORM_ATTN_BACKWARD_H_
 #include "zoo/teco/executor.h"
 
 namespace optest {
-
-class FlashAttentionExecutor : public TecoExecutor {
+class MsDeformAttnBackwardExecutor : public TecoExecutor {
  public:
-    FlashAttentionExecutor() {}
-    ~FlashAttentionExecutor() {}
-
+    ~MsDeformAttnBackwardExecutor() override;
+    void destroy() override;
     void paramCheck();
     void paramParse();
     void paramGeneration();
@@ -48,37 +43,11 @@ class FlashAttentionExecutor : public TecoExecutor {
     void cpuCompute();
     int64_t getTheoryOps() override;
     int64_t getTheoryIoSize() override;
-
  private:
-    bool has_softmax_scale_ = false;
-    float softmax_scale_ = 0.0f;
-    int max_prefill_len_;
-    int max_decode_len_;
-    int batch_size_;
-    int total_q_tokens_;
-    int local_head_num_;
-    int local_kv_head_num_;
-    int size_per_head_;
-    int block_size_;
-    int block_table_dim_;
-    int max_block_num_;
-
-    tecoopsTensorDescriptor_t blockTableDesc_;
-    tecoopsTensorDescriptor_t qDataDesc_;
-    tecoopsTensorDescriptor_t kCacheDesc_;
-    tecoopsTensorDescriptor_t vCacheDesc_;
-    tecoopsTensorDescriptor_t oDataDesc_;
-
-    const void *blockTable_;
-    const void *qData_;
-    const void *kCache_;
-    const void *vCache_;
-    void *oData_;
-
-    std::vector<int> q_seq_lens_;
-    std::vector<int> kv_seq_lens_;
+    void *list_workspace_ = nullptr;
+    int32_t *value_heads_ = nullptr, *value_next_ = nullptr;
+    float *node_wx_ = nullptr, *node_wy_ = nullptr;
+    int batch_, value_len_, heads_, dim_, queries_, levels_, points_;
 };
-
 }  // namespace optest
-
-#endif  // ZOO_TECO_FLASH_ATTENTION_FLASH_ATTENTION_H_  // NOLINT
+#endif  // ZOO_TECO_MS_DEFORM_ATTN_BACKWARD_H_

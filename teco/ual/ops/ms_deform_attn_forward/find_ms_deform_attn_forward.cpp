@@ -27,58 +27,23 @@
 // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-#ifndef ZOO_TECO_FLASH_ATTENTION_FLASH_ATTENTION_H_  // NOLINT
-#define ZOO_TECO_FLASH_ATTENTION_FLASH_ATTENTION_H_
+#include "ual/ops/ms_deform_attn_forward/find_ms_deform_attn_forward.h"
 
-#include <vector>
-#include "interface/include/tecoops.h"
-#include "zoo/teco/executor.h"
+namespace tecoops {
+namespace ual {
+namespace ops {
 
-namespace optest {
+int findMsDeformAttnForwardBranch(
+    const args::MsDeformAttnForwardPatchArgs *arg) {
+    if (arg->data_type == common::UALDataType::UAL_DTYPE_FLOAT) {
+        return 0;
+    }
+    if (arg->data_type == common::UALDataType::UAL_DTYPE_HALF) {
+        return 1;
+    }
+    return -1;
+}
 
-class FlashAttentionExecutor : public TecoExecutor {
- public:
-    FlashAttentionExecutor() {}
-    ~FlashAttentionExecutor() {}
-
-    void paramCheck();
-    void paramParse();
-    void paramGeneration();
-    void compute();
-    void cpuCompute();
-    int64_t getTheoryOps() override;
-    int64_t getTheoryIoSize() override;
-
- private:
-    bool has_softmax_scale_ = false;
-    float softmax_scale_ = 0.0f;
-    int max_prefill_len_;
-    int max_decode_len_;
-    int batch_size_;
-    int total_q_tokens_;
-    int local_head_num_;
-    int local_kv_head_num_;
-    int size_per_head_;
-    int block_size_;
-    int block_table_dim_;
-    int max_block_num_;
-
-    tecoopsTensorDescriptor_t blockTableDesc_;
-    tecoopsTensorDescriptor_t qDataDesc_;
-    tecoopsTensorDescriptor_t kCacheDesc_;
-    tecoopsTensorDescriptor_t vCacheDesc_;
-    tecoopsTensorDescriptor_t oDataDesc_;
-
-    const void *blockTable_;
-    const void *qData_;
-    const void *kCache_;
-    const void *vCache_;
-    void *oData_;
-
-    std::vector<int> q_seq_lens_;
-    std::vector<int> kv_seq_lens_;
-};
-
-}  // namespace optest
-
-#endif  // ZOO_TECO_FLASH_ATTENTION_FLASH_ATTENTION_H_  // NOLINT
+}  // namespace ops
+}  // namespace ual
+}  // namespace tecoops
