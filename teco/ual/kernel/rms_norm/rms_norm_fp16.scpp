@@ -151,19 +151,50 @@ __global__ void teco_slave_rms_norm_fp16(RmsNormArgs args) {
                          MemcpyGlobalToSpm, get_in[na + 1]);
         }
 
-        // 6c. 两条独立累加链：每行自身的表达式与下标顺序不变
+        // 6c. Ordered sum of squares.  The two rows keep their own accumulators and their
+        // own ascending d order, so the FP evaluate order is byte-for-byte the one the scalar
+        // loop had; only the memory access is widened: one 16-wide widen-load (16 halves ->
+        // 16 fp32) replaces 16 scalar half loads + 16 half->float converts.  No reassociation.
         float sum_sq0 = 0.0f;
         float sum_sq1 = 0.0f;
+        int dsq = 0;
         if (has2) {
-            for (int d = 0; d < D; ++d) {
-                float val0 = static_cast<float>(inbuf[a][d]);
-                float val1 = static_cast<float>(inbuf[a + 1][d]);
+            for (; dsq + 16 <= D; dsq += 16) {
+                float16v16 h0, h1;
+                simd_loadu(h0, inbuf[a] + dsq);
+                simd_loadu(h1, inbuf[a + 1] + dsq);
+                const floatv16 w0 = simd_vfcvths(h0);
+                const floatv16 w1 = simd_vfcvths(h1);
+                const float *p0 = (const float *)&w0;
+                const float *p1 = (const float *)&w1;
+#pragma unroll
+                for (int t = 0; t < 16; ++t) {
+                    float val0 = p0[t];
+                    float val1 = p1[t];
+                    sum_sq0 += val0 * val0;
+                    sum_sq1 += val1 * val1;
+                }
+            }
+            for (; dsq < D; ++dsq) {
+                float val0 = static_cast<float>(inbuf[a][dsq]);
+                float val1 = static_cast<float>(inbuf[a + 1][dsq]);
                 sum_sq0 += val0 * val0;
                 sum_sq1 += val1 * val1;
             }
         } else {
-            for (int d = 0; d < D; ++d) {
-                float val0 = static_cast<float>(inbuf[a][d]);
+            for (; dsq + 16 <= D; dsq += 16) {
+                float16v16 h0;
+                simd_loadu(h0, inbuf[a] + dsq);
+                const floatv16 w0 = simd_vfcvths(h0);
+                const float *p0 = (const float *)&w0;
+#pragma unroll
+                for (int t = 0; t < 16; ++t) {
+                    float val0 = p0[t];
+                    sum_sq0 += val0 * val0;
+                }
+            }
+            for (; dsq < D; ++dsq) {
+                float val0 = static_cast<float>(inbuf[a][dsq]);
                 sum_sq0 += val0 * val0;
             }
         }
@@ -286,25 +317,67 @@ __global__ void teco_slave_rms_norm_fp16_add(RmsNormArgs args) {
                          MemcpyGlobalToSpm, get_res[na + 1]);
         }
 
-        // 6b. 两条独立累加链：每行的表达式与下标顺序不变
+        // 6b. Ordered sum of squares with the fused residual add.  Same FP evaluate order as
+        // the scalar loop (per row: (float)in + (float)res, narrow to half for residual_out,
+        // then sum_sq += val*val with d ascending), only the loads/converts are widened.
         float sum_sq0 = 0.0f;
         float sum_sq1 = 0.0f;
+        int dsq = 0;
         if (has2) {
-            for (int d = 0; d < D; ++d) {
-                float val0 = static_cast<float>(inbuf[a][d])
-                             + static_cast<float>(resbuf[a][d]);
-                float val1 = static_cast<float>(inbuf[a + 1][d])
-                             + static_cast<float>(resbuf[a + 1][d]);
-                resbuf[a][d] = static_cast<half>(val0);      // residual_out
-                resbuf[a + 1][d] = static_cast<half>(val1);  // residual_out
+            for (; dsq + 16 <= D; dsq += 16) {
+                float16v16 hi0, hr0, hi1, hr1;
+                simd_loadu(hi0, inbuf[a] + dsq);
+                simd_loadu(hr0, resbuf[a] + dsq);
+                simd_loadu(hi1, inbuf[a + 1] + dsq);
+                simd_loadu(hr1, resbuf[a + 1] + dsq);
+                const floatv16 wi0 = simd_vfcvths(hi0);
+                const floatv16 wr0 = simd_vfcvths(hr0);
+                const floatv16 wi1 = simd_vfcvths(hi1);
+                const floatv16 wr1 = simd_vfcvths(hr1);
+                const float *pi0 = (const float *)&wi0;
+                const float *pr0 = (const float *)&wr0;
+                const float *pi1 = (const float *)&wi1;
+                const float *pr1 = (const float *)&wr1;
+#pragma unroll
+                for (int t = 0; t < 16; ++t) {
+                    float val0 = pi0[t] + pr0[t];
+                    float val1 = pi1[t] + pr1[t];
+                    resbuf[a][dsq + t] = static_cast<half>(val0);      // residual_out
+                    resbuf[a + 1][dsq + t] = static_cast<half>(val1);  // residual_out
+                    sum_sq0 += val0 * val0;
+                    sum_sq1 += val1 * val1;
+                }
+            }
+            for (; dsq < D; ++dsq) {
+                float val0 = static_cast<float>(inbuf[a][dsq])
+                             + static_cast<float>(resbuf[a][dsq]);
+                float val1 = static_cast<float>(inbuf[a + 1][dsq])
+                             + static_cast<float>(resbuf[a + 1][dsq]);
+                resbuf[a][dsq] = static_cast<half>(val0);      // residual_out
+                resbuf[a + 1][dsq] = static_cast<half>(val1);  // residual_out
                 sum_sq0 += val0 * val0;
                 sum_sq1 += val1 * val1;
             }
         } else {
-            for (int d = 0; d < D; ++d) {
-                float val0 = static_cast<float>(inbuf[a][d])
-                             + static_cast<float>(resbuf[a][d]);
-                resbuf[a][d] = static_cast<half>(val0);      // residual_out
+            for (; dsq + 16 <= D; dsq += 16) {
+                float16v16 hi0, hr0;
+                simd_loadu(hi0, inbuf[a] + dsq);
+                simd_loadu(hr0, resbuf[a] + dsq);
+                const floatv16 wi0 = simd_vfcvths(hi0);
+                const floatv16 wr0 = simd_vfcvths(hr0);
+                const float *pi0 = (const float *)&wi0;
+                const float *pr0 = (const float *)&wr0;
+#pragma unroll
+                for (int t = 0; t < 16; ++t) {
+                    float val0 = pi0[t] + pr0[t];
+                    resbuf[a][dsq + t] = static_cast<half>(val0);      // residual_out
+                    sum_sq0 += val0 * val0;
+                }
+            }
+            for (; dsq < D; ++dsq) {
+                float val0 = static_cast<float>(inbuf[a][dsq])
+                             + static_cast<float>(resbuf[a][dsq]);
+                resbuf[a][dsq] = static_cast<half>(val0);      // residual_out
                 sum_sq0 += val0 * val0;
             }
         }
