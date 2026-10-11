@@ -33,7 +33,4 @@ using tecoops::ual::args::ReshapeAndCacheArgs;
 
 __global__ void teco_slave_reshape_and_cache_fp16(ReshapeAndCacheArgs args);
 
-
-__global__ void teco_slave_reshape_and_cache_fp16_dma(ReshapeAndCacheArgs args);
-
 #endif  // TECO_UAL_KERNEL_RESHAPE_AND_CACHE_RESHAPE_AND_CACHE_H_
