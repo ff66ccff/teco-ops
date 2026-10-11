@@ -36,30 +36,42 @@ namespace ops {
 // Binds the ms_deform_attn_forward implementation once per call, outside the
 // kernel (AGENTS.md rule 6: no hot-path selector, no getenv).
 //
-// The span-merge kernel loads every corner block of one (level, point) with ONE
-// blocked transfer into T value_record[128].  The widest such span is 2*width
-// pixels and width <= value_len for every level, so
+// The delivered c14 span-merge kernel loads every corner block of one
+// (level, point) with ONE blocked transfer into T value_record[128].  The widest
+// such span is 2*width pixels and width <= value_len for every level, so
 //
 //     2 * value_len * num_heads * head_dim <= 128
 //
-// is a conservative, data independent guarantee that the record never overflows
-// (it implies the tighter per-level form 2*width*num_heads*head_dim <= 128 that
-// the CPU bit-exact model uses).  Shapes that fail it keep the delivered kernel
-// verbatim, so the specialization is fail-closed on the shape it was validated
-// for.
+// is a conservative, data independent guarantee that the record never overflows.
+// Shapes that fail it keep the delivered kernel verbatim, so the specialization
+// is fail-closed on the shape it was validated for.
+//
+// The compacted row-span covers the shapes that predicate cannot: it merges the
+// two x-corners of each bilinear row into one transfer whose origin is shifted by
+// head*head_dim, so a two-pixel span needs only
+//
+//     num_heads * head_dim + head_dim <= 512
+//
+// elements.  That holds for every real Deformable-DETR geometry (m=8, d=32 gives
+// 288) and is still false for the delivered case_0, which keeps the c14 kernel.
 int findMsDeformAttnForwardBranch(
     const args::MsDeformAttnForwardPatchArgs *arg) {
     const args::MsDeformAttnForwardArgs *a = arg->atargs;
-    const bool span_fits =
-        a != nullptr && a->value_len > 0 && a->num_heads > 0 && a->head_dim > 0 &&
-        2LL * a->value_len * a->num_heads * a->head_dim <= 128;
-    if (arg->data_type == common::UALDataType::UAL_DTYPE_FLOAT) {
-        return span_fits ? 2 : 0;
-    }
+    const bool ok = a != nullptr && a->value_len > 0 && a->num_heads > 0 &&
+                    a->head_dim > 0 && a->head_dim <= 128;
+    const long md = ok ? static_cast<long>(a->num_heads) * a->head_dim : 0;
+    const long d = ok ? a->head_dim : 0;
+
     if (arg->data_type == common::UALDataType::UAL_DTYPE_HALF) {
+        const bool span_fits = ok && 2LL * a->value_len * md <= 128;
         return span_fits ? 3 : 1;
     }
-    return -1;
+    if (arg->data_type != common::UALDataType::UAL_DTYPE_FLOAT) {
+        return -1;
+    }
+    if (ok && 2LL * a->value_len * md <= 128) return 2;
+    if (ok && md + d <= 512) return 4;
+    return 0;
 }
 
 }  // namespace ops
