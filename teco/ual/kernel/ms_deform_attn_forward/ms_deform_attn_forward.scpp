@@ -26,9 +26,9 @@
 // CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
 // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
 #include "ual/kernel/ms_deform_attn_forward/ms_deform_attn_forward.h"
 
-#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <sdaa_memcpy.h>
@@ -53,20 +53,6 @@ __device__ inline float read_as_float(const half *data, size_t index) {
     return static_cast<float>(data[index]);
 }
 
-// value is [batch, pixel, head, dim] inside one level plane, so pixel blocks are
-// contiguous with stride num_heads*head_dim.  The four bilinear corners of one
-// sampling point therefore live in a contiguous pixel span of at most 2*width
-// pixels, and one blocked transfer can fetch every corner block of that
-// (level, point) instead of one transfer per valid corner.
-//
-// The span merge is used only when 2*width*num_heads*head_dim fits the existing
-// 128-element record, which is decided once per launch from the spatial shapes
-// (loop invariant, data independent, no getenv and no per-corner branch).  Every
-// other shape keeps the original per-corner path verbatim.  The record is
-// pixel-aligned (it starts at head 0 of the first pixel) so a corner block is at
-// offset (pixel - start)*num_heads*head_dim + head*head_dim, and the additions
-// still happen in the original order (row 0 then row 1, left then right) with
-// the original expressions and rounding, so the result stays bit-identical.
 template <typename T>
 __device__ void ms_deform_attn_forward_kernel(MsDeformAttnForwardArgs args) {
     const int n = args.batch;
@@ -81,16 +67,6 @@ __device__ void ms_deform_attn_forward_kernel(MsDeformAttnForwardArgs args) {
     const T *locations = static_cast<const T *>(args.sampling_locations);
     const T *weights = static_cast<const T *>(args.attention_weights);
     T *output = static_cast<T *>(args.output);
-
-    const int record_capacity = 128;
-    bool span_merge = true;
-    for (int level = 0; level < levels; ++level) {
-        const int width = static_cast<int>(shapes[level * 2 + 1]);
-        if (2 * width * m * d > record_capacity) {
-            span_merge = false;
-            break;
-        }
-    }
 
     // One work item owns one (batch, query, head) vector.  Sampling
     // coordinates and weights are shared by all D lanes; keeping the
@@ -146,72 +122,15 @@ __device__ void ms_deform_attn_forward_kernel(MsDeformAttnForwardArgs args) {
                 const int ys[2] = {y0, y1};
                 const float wx[2] = {wx0, wx1};
                 const float wy[2] = {wy0, wy1};
-
-                if (span_merge) {
-                    const bool vx0 = (x0 >= 0 && x0 < w);
-                    const bool vx1 = (x1 >= 0 && x1 < w);
-                    const bool vy0 = (y0 >= 0 && y0 < h);
-                    const bool vy1 = (y1 >= 0 && y1 < h);
-                    int lo0 = INT_MAX, hi0 = INT_MIN, lo1 = INT_MAX, hi1 = INT_MIN;
-                    if (vy0) {
-                        if (vx0) { lo0 = x0; hi0 = x0; }
-                        if (vx1) {
-                            if (x1 < lo0) lo0 = x1;
-                            if (x1 > hi0) hi0 = x1;
-                        }
-                    }
-                    if (vy1) {
-                        if (vx0) { lo1 = x0; hi1 = x0; }
-                        if (vx1) {
-                            if (x1 < lo1) lo1 = x1;
-                            if (x1 > hi1) hi1 = x1;
-                        }
-                    }
-                    if (lo0 != INT_MAX || lo1 != INT_MAX) {
-                        const int start_pixel =
-                            (lo0 != INT_MAX) ? (y0 * w + lo0) : (y1 * w + lo1);
-                        const int last_pixel =
-                            (hi1 != INT_MIN) ? (y1 * w + hi1) : (y0 * w + hi0);
-                        const int span = last_pixel - start_pixel + 1;
-                        ::memcpy(value_record,
-                                 value + value_base + static_cast<size_t>(start_pixel) * m * d,
-                                 static_cast<size_t>(span) * m * d * sizeof(T));
-                        if (vy0) {
-                            for (int ix = 0; ix < 2; ++ix) {
-                                if (!(ix == 0 ? vx0 : vx1)) continue;
-                                const size_t off =
-                                    static_cast<size_t>(y0 * w + xs[ix] - start_pixel) * m * d +
-                                    static_cast<size_t>(head) * d;
-                                const float factor = wx[ix] * wy[0] * aw;
-                                for (int dim = 0; dim < d; ++dim) {
-                                    acc[dim] += read_as_float(value_record, off + dim) * factor;
-                                }
-                            }
-                        }
-                        if (vy1) {
-                            for (int ix = 0; ix < 2; ++ix) {
-                                if (!(ix == 0 ? vx0 : vx1)) continue;
-                                const size_t off =
-                                    static_cast<size_t>(y1 * w + xs[ix] - start_pixel) * m * d +
-                                    static_cast<size_t>(head) * d;
-                                const float factor = wx[ix] * wy[1] * aw;
-                                for (int dim = 0; dim < d; ++dim) {
-                                    acc[dim] += read_as_float(value_record, off + dim) * factor;
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    for (int iy = 0; iy < 2; ++iy) {
-                        for (int ix = 0; ix < 2; ++ix) {
-                            if (xs[ix] >= 0 && xs[ix] < w && ys[iy] >= 0 && ys[iy] < h) {
-                                const size_t pixel = static_cast<size_t>(ys[iy]) * w + xs[ix];
-                                const size_t value_index = value_base + (pixel * m + head) * d;
-                                ::memcpy(value_record, value + value_index, d * sizeof(T));
-                                const float factor = wx[ix] * wy[iy] * aw;
-                                for (int dim = 0; dim < d; ++dim) {
-                                    acc[dim] += read_as_float(value_record, dim) * factor;
-                                }
+                for (int iy = 0; iy < 2; ++iy) {
+                    for (int ix = 0; ix < 2; ++ix) {
+                        if (xs[ix] >= 0 && xs[ix] < w && ys[iy] >= 0 && ys[iy] < h) {
+                            const size_t pixel = static_cast<size_t>(ys[iy]) * w + xs[ix];
+                            const size_t value_index = value_base + (pixel * m + head) * d;
+                            ::memcpy(value_record, value + value_index, d * sizeof(T));
+                            const float factor = wx[ix] * wy[iy] * aw;
+                            for (int dim = 0; dim < d; ++dim) {
+                                acc[dim] += read_as_float(value_record, dim) * factor;
                             }
                         }
                     }
