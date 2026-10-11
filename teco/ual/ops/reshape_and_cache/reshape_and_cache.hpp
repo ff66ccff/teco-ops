@@ -48,10 +48,12 @@ struct ReshapeAndCacheType {
 
 static ReshapeAndCacheType::PImplType ReshapeAndCacheAlgos[] = {
     teco_slave_reshape_and_cache_fp16,
+    teco_slave_reshape_and_cache_fp16_dma,
 };
 
 static const char *ReshapeAndCacheDiscription[] = {
     "teco_slave_reshape_and_cache_fp16",
+    "teco_slave_reshape_and_cache_fp16_dma",
 };
 
 struct ReshapeAndCacheOp : public BaseOp<ReshapeAndCacheOp, ReshapeAndCacheType> {
