@@ -131,6 +131,54 @@ void rms_norm_compat_torch(
                          num_tokens, hidden_size);
 }
 
+void weight_stream_gemv_torch(
+    torch::Tensor x, torch::Tensor weight, torch::Tensor out) {
+    tecoopsHandle_t handle = getGlobalHandle();
+    // Keep the launch on the caller's current SDAA stream, like rms_norm.
+    tecoopsSetStream(handle, torch::sdaa::getCurrentSDAAStream());
+    int n = static_cast<int>(weight.size(0));
+    int k = static_cast<int>(weight.size(1));
+
+    tecoopsWeightStreamGemv(handle,
+                            x.data_ptr(), weight.data_ptr(), out.data_ptr(),
+                            n, k);
+}
+
+// Drop-in replacement for torch.nn.functional.linear that uses the M=1
+// weight-streaming GEMV when the call really is a single decode row, and the
+// vendor GEMM otherwise (prefill / profiling / any unsupported shape).
+//
+// The selection is deliberately in C++ inside ONE opaque custom operator: a
+// Python-level shape test would be traced by Dynamo, and the traced decode graph
+// would then keep whichever branch the profiling trace (M = max_num_batched_tokens)
+// happened to see.  Keeping it here means the operator is a single graph node that
+// always executes, and the runtime shape decides.
+torch::Tensor linear_stream_torch(torch::Tensor x, torch::Tensor weight,
+                                  c10::optional<torch::Tensor> bias) {
+    const int64_t n = weight.size(0);
+    const int64_t k = weight.size(1);
+    const bool single_row = (x.dim() == 2 && x.size(0) == 1 && x.size(1) == k);
+
+    if (single_row && x.scalar_type() == at::kHalf &&
+        weight.scalar_type() == at::kHalf && x.is_contiguous() &&
+        weight.is_contiguous() && (n % 256 == 0) && (k % 16 == 0)) {
+        auto out = torch::empty({n}, x.options());
+        tecoopsHandle_t handle = getGlobalHandle();
+        tecoopsSetStream(handle, torch::sdaa::getCurrentSDAAStream());
+        tecoopsWeightStreamGemv(handle, x.data_ptr(), weight.data_ptr(),
+                                out.data_ptr(), static_cast<int>(n),
+                                static_cast<int>(k));
+        auto res = out.unsqueeze(0);
+        if (bias.has_value() && bias->defined()) {
+            res = res + bias->to(res.scalar_type());
+        }
+        return res;
+    }
+
+    at::Tensor b = (bias.has_value() && bias->defined()) ? bias.value() : at::Tensor();
+    return torch::linear(x, weight, b);
+}
+
 void flash_attn_varlen_func_torch(
     torch::Tensor q,
     torch::Tensor k,
@@ -396,6 +444,8 @@ PYBIND11_MODULE(_torch_ext, m) {
     m.def("reshape_and_cache", &reshape_and_cache_torch, "reshape_and_cache (SDAA)");
     m.def("rms_norm", &rms_norm_torch, "rms_norm (SDAA)");
     m.def("rms_norm_compat", &rms_norm_compat_torch, "rms_norm_compat (SDAA)");
+    m.def("weight_stream_gemv", &weight_stream_gemv_torch, "weight_stream_gemv (SDAA)");
+    m.def("linear_stream", &linear_stream_torch, "M=1 weight-streaming linear (SDAA)");
     m.def("flash_attn_varlen_func", &flash_attn_varlen_func_torch, "flash_attn_varlen_func (SDAA)");
     m.def("causal_conv1d_fn_torch", &causal_conv1d_fn_torch, "causal_conv1d_fn_torch (SDAA)");
     m.def("ms_deform_attn_forward", &ms_deform_attn_forward_torch,

@@ -3,11 +3,13 @@ import torch
 from ._torch_ext import (flatten_rays, morton3D_invert, reshape_and_cache, rms_norm,
                          rms_norm_compat, flash_attn_varlen_func,
                          causal_conv1d_fn_torch, ms_deform_attn_forward,
-                         ms_deform_attn_backward)
+                         ms_deform_attn_backward, weight_stream_gemv,
+                         linear_stream)
 
 __all__ = ['flatten_rays', 'morton3D_invert', 'reshape_and_cache', 'rms_norm',
            'rms_norm_compat', 'flash_attn_varlen_func', 'causal_conv1d_fn_torch',
-           'ms_deform_attn_forward', 'ms_deform_attn_backward', 'ms_deform_attn']
+           'ms_deform_attn_forward', 'ms_deform_attn_backward', 'ms_deform_attn',
+           'weight_stream_gemv', 'linear_stream']
 
 
 class _MSDeformAttn(torch.autograd.Function):
