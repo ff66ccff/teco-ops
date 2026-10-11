@@ -31,6 +31,7 @@
 #define TECOOPS_UAL_OPS_MS_DEFORM_ATTN_FORWARD_H_
 
 #include "ual/kernel/ms_deform_attn_forward/ms_deform_attn_forward.h"
+#include "ual/kernel/z_ms_deform_attn_forward_span/z_ms_deform_attn_forward_span.h"
 #include "ual/ops/base_op.hpp"
 #include "ual/ops/ms_deform_attn_forward/find_ms_deform_attn_forward.h"
 
@@ -48,14 +49,21 @@ struct MsDeformAttnForwardType {
     using PImplType = void (*)(ArgsType);
 };
 
+// Slots 0/1 are the delivered kernels, 2/3 the span-merge specialization that
+// lives in the last-sorting z_ms_deform_attn_forward_span TU.  The choice between
+// them is bound once per call in findMsDeformAttnForwardBranch.
 static MsDeformAttnForwardType::PImplType MsDeformAttnForwardAlgos[] = {
     teco_slave_ms_deform_attn_forward_fp32,
     teco_slave_ms_deform_attn_forward_fp16,
+    teco_slave_ms_deform_attn_forward_span_fp32,
+    teco_slave_ms_deform_attn_forward_span_fp16,
 };
 
 static const char *MsDeformAttnForwardDescriptions[] = {
     "teco_slave_ms_deform_attn_forward_fp32",
     "teco_slave_ms_deform_attn_forward_fp16",
+    "teco_slave_ms_deform_attn_forward_span_fp32",
+    "teco_slave_ms_deform_attn_forward_span_fp16",
 };
 
 struct MsDeformAttnForwardOp
