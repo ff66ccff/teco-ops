@@ -252,7 +252,17 @@ __device__ __always_inline void flash_attention_half(FlashAttentionArgs args) {
                 }
             }
     
-            for (int j = 0; j < k_seq_len; j += BN) {
+            // Causal KV-tile bound.  The causal mask below is applied unconditionally and a
+            // tile whose whole column range is masked out contributes exp(-inf) = 0 to l and 0
+            // to o while leaving m unchanged, so the online-softmax state after it is
+            // bit-identical to the state before it.  Stopping the scan at the first such tile
+            // (same q_start expression as apply_causal_mask) therefore visits exactly the tiles
+            // that can contribute and leaves every device output bit identical.
+            int causal_q_start = k_seq_len - q_seq_len;
+            if (causal_q_start < 0) causal_q_start = 0;
+            int kv_tile_end = causal_q_start + i + cur_BM;
+            if (kv_tile_end > k_seq_len) kv_tile_end = k_seq_len;
+            for (int j = 0; j < kv_tile_end; j += BN) {
                 int cur_BN = MIN(BN, k_seq_len - j);
 
                 // load k [cur_BN, size_per_head] -> ktmp
