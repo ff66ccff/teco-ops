@@ -1,11 +1,12 @@
 import torch
 
 from ._torch_ext import (flatten_rays, morton3D_invert, reshape_and_cache, rms_norm,
-                         flash_attn_varlen_func, causal_conv1d_fn_torch,
-                         ms_deform_attn_forward, ms_deform_attn_backward)
+                         rms_norm_compat, flash_attn_varlen_func,
+                         causal_conv1d_fn_torch, ms_deform_attn_forward,
+                         ms_deform_attn_backward)
 
 __all__ = ['flatten_rays', 'morton3D_invert', 'reshape_and_cache', 'rms_norm',
-           'flash_attn_varlen_func', 'causal_conv1d_fn_torch',
+           'rms_norm_compat', 'flash_attn_varlen_func', 'causal_conv1d_fn_torch',
            'ms_deform_attn_forward', 'ms_deform_attn_backward', 'ms_deform_attn']
 
 
