@@ -65,8 +65,12 @@ int findMsDeformAttnForwardBranch(
         a != nullptr && a->value_len > 0 && a->num_heads > 0 && a->head_dim > 0;
     const bool plane_fits = shaped && 1LL * a->value_len * a->num_heads * a->head_dim <= 128;
     const bool span_fits = shaped && 2LL * a->value_len * a->num_heads * a->head_dim <= 128;
+    // Slot 6 is the compacted row-span specialization (fp32 only), for geometries where
+    // neither the whole-plane nor the span-merge staging fits.
+    const bool rowspan_fits = shaped && a->head_dim <= 128 &&
+                              1LL * a->num_heads * a->head_dim + a->head_dim <= 512;
     if (arg->data_type == common::UALDataType::UAL_DTYPE_FLOAT) {
-        return plane_fits ? 4 : (span_fits ? 2 : 0);
+        return plane_fits ? 4 : (span_fits ? 2 : (rowspan_fits ? 6 : 0));
     }
     if (arg->data_type == common::UALDataType::UAL_DTYPE_HALF) {
         return plane_fits ? 5 : (span_fits ? 3 : 1);

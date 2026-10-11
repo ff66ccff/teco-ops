@@ -33,6 +33,7 @@
 #include "ual/kernel/ms_deform_attn_forward/ms_deform_attn_forward.h"
 #include "ual/kernel/z_ms_deform_attn_forward_span/z_ms_deform_attn_forward_span.h"
 #include "ual/kernel/zz_ms_deform_attn_forward_plane/zz_ms_deform_attn_forward_plane.h"
+#include "ual/kernel/zz_ms_deform_attn_forward_rowspan/zz_ms_deform_attn_forward_rowspan.h"
 #include "ual/ops/base_op.hpp"
 #include "ual/ops/ms_deform_attn_forward/find_ms_deform_attn_forward.h"
 
@@ -53,7 +54,8 @@ struct MsDeformAttnForwardType {
 // Slots 0/1 are the delivered kernels, 2/3 the span-merge specialization in the
 // z_ms_deform_attn_forward_span TU and 4/5 the whole-plane staging
 // specialization in the last-sorting zz_ms_deform_attn_forward_plane TU.  The
-// choice between them is bound once per call in findMsDeformAttnForwardBranch.
+// choice between them is bound once per call in findMsDeformAttnForwardBranch; slot 6 is the
+// compacted row-span specialization (fp32 only).
 static MsDeformAttnForwardType::PImplType MsDeformAttnForwardAlgos[] = {
     teco_slave_ms_deform_attn_forward_fp32,
     teco_slave_ms_deform_attn_forward_fp16,
@@ -61,6 +63,7 @@ static MsDeformAttnForwardType::PImplType MsDeformAttnForwardAlgos[] = {
     teco_slave_ms_deform_attn_forward_span_fp16,
     teco_slave_ms_deform_attn_forward_plane_fp32,
     teco_slave_ms_deform_attn_forward_plane_fp16,
+    teco_slave_ms_deform_attn_forward_rowspan_fp32,
 };
 
 static const char *MsDeformAttnForwardDescriptions[] = {
@@ -70,6 +73,7 @@ static const char *MsDeformAttnForwardDescriptions[] = {
     "teco_slave_ms_deform_attn_forward_span_fp16",
     "teco_slave_ms_deform_attn_forward_plane_fp32",
     "teco_slave_ms_deform_attn_forward_plane_fp16",
+    "teco_slave_ms_deform_attn_forward_rowspan_fp32",
 };
 
 struct MsDeformAttnForwardOp
