@@ -176,7 +176,8 @@ def cpu_wrapper_contract():
     def forbidden(*args):
         raise AssertionError("unexpected native call in CPU wrapper check")
     for name in ("flatten_rays", "morton3D_invert", "reshape_and_cache", "rms_norm",
-                 "flash_attn_varlen_func", "causal_conv1d_fn_torch", "ms_deform_attn_forward"):
+                 "rms_norm_compat", "flash_attn_varlen_func", "causal_conv1d_fn_torch",
+                 "ms_deform_attn_forward", "weight_stream_gemv", "linear_stream"):
         setattr(native, name, forbidden)
     captured = []
     def backward_mock(*args):
