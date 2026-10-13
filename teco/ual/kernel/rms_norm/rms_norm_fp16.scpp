@@ -48,6 +48,26 @@ __device__ __always_inline void rms_norm_epilogue(const half *src, const half *w
                                                   float rstd, int D) {
     int d = 0;
     const floatv16 rstd_vec = simd_vcpyfs(rstd);
+    // H2: unroll/dual-issue the 16-wide epilogue by 2.  Each element keeps the identical
+    // operation order ((input * rstd) * weight, same rounding), so the result is bit-exact;
+    // only the schedule (two independent dependency chains in flight) changes.
+    for (; d + 32 <= D; d += 32) {
+        float16v16 input_half0, weight_half0, input_half1, weight_half1;
+        simd_loadu(input_half0, src + d);
+        simd_loadu(weight_half0, weight + d);
+        simd_loadu(input_half1, src + d + 16);
+        simd_loadu(weight_half1, weight + d + 16);
+        const floatv16 input_vec0 = simd_vfcvths(input_half0);
+        const floatv16 weight_vec0 = simd_vfcvths(weight_half0);
+        const floatv16 input_vec1 = simd_vfcvths(input_half1);
+        const floatv16 weight_vec1 = simd_vfcvths(weight_half1);
+        const floatv16 weighted0 = (input_vec0 * rstd_vec) * weight_vec0;
+        const floatv16 weighted1 = (input_vec1 * rstd_vec) * weight_vec1;
+        const float16v16 output_half0 = simd_vfcvtsh(weighted0);
+        const float16v16 output_half1 = simd_vfcvtsh(weighted1);
+        simd_storeu(output_half0, dst + d);
+        simd_storeu(output_half1, dst + d + 16);
+    }
     for (; d + 16 <= D; d += 16) {
         float16v16 input_half, weight_half;
         simd_loadu(input_half, src + d);
