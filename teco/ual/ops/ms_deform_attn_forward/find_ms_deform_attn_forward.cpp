@@ -36,28 +36,40 @@ namespace ops {
 // Binds the ms_deform_attn_forward implementation once per call, outside the
 // kernel (AGENTS.md rule 6: no hot-path selector, no getenv).
 //
-// The span-merge kernel loads every corner block of one (level, point) with ONE
-// blocked transfer into T value_record[128].  The widest such span is 2*width
-// pixels and width <= value_len for every level, so
+// Three implementations are bound once per call, in this order of preference:
 //
-//     2 * value_len * num_heads * head_dim <= 128
+//   slot 4/5  whole-plane staging (zz_ms_deform_attn_forward_plane Tue).  One
+//             blocked transfer carries the whole per-batch value plane, so the
+//             same value leaf is never re-transferred for a second sampling
+//             point or level.  Requires the data independent capacity test
+//                 value_len * num_heads * head_dim <= 128
+//             because the staged record is T value_record[128].
+//   slot 2/3  span-merge (z_ms_deform_attn_forward_span TU).  The span-merge
+//             kernel loads every corner block of one (level, point) with ONE
+//             blocked transfer into T value_record[128].  The widest such span
+//             is 2*width pixels and width <= value_len for every level, so
+//                 2 * value_len * num_heads * head_dim <= 128
+//             is a conservative, data independent guarantee that the record
+//             never overflows (it implies the tighter per-level form
+//             2*width*num_heads*head_dim <= 128 that the CPU bit-exact model
+//             uses).
+//   slot 0/1  the delivered kernel verbatim.
 //
-// is a conservative, data independent guarantee that the record never overflows
-// (it implies the tighter per-level form 2*width*num_heads*head_dim <= 128 that
-// the CPU bit-exact model uses).  Shapes that fail it keep the delivered kernel
-// verbatim, so the specialization is fail-closed on the shape it was validated
-// for.
+// Every predicate is data independent and evaluated outside the kernel, so the
+// specialization is fail-closed on the shapes it was validated for and the hot
+// path keeps no selector branch and no getenv.
 int findMsDeformAttnForwardBranch(
     const args::MsDeformAttnForwardPatchArgs *arg) {
     const args::MsDeformAttnForwardArgs *a = arg->atargs;
-    const bool span_fits =
-        a != nullptr && a->value_len > 0 && a->num_heads > 0 && a->head_dim > 0 &&
-        2LL * a->value_len * a->num_heads * a->head_dim <= 128;
+    const bool shaped =
+        a != nullptr && a->value_len > 0 && a->num_heads > 0 && a->head_dim > 0;
+    const bool plane_fits = shaped && 1LL * a->value_len * a->num_heads * a->head_dim <= 128;
+    const bool span_fits = shaped && 2LL * a->value_len * a->num_heads * a->head_dim <= 128;
     if (arg->data_type == common::UALDataType::UAL_DTYPE_FLOAT) {
-        return span_fits ? 2 : 0;
+        return plane_fits ? 4 : (span_fits ? 2 : 0);
     }
     if (arg->data_type == common::UALDataType::UAL_DTYPE_HALF) {
-        return span_fits ? 3 : 1;
+        return plane_fits ? 5 : (span_fits ? 3 : 1);
     }
     return -1;
 }
