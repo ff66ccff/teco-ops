@@ -62,6 +62,11 @@ Two gates, both non-zero-on-failure so ``python_api_test`` CI steps fail loudly:
      IEEE model does not (measured by the rms_norm_compat work).  Every
      deviation must be inside that mask.
 
+  In-place calls use the same CPU/subnormal gate, plus a strict bit comparison
+  against an out-of-place device call on identical inputs. Padded cases move the
+  entire fused-QKV buffer to SDAA before slicing, so both input and in-place
+  output retain the real row stride. The untouched V slice must remain exact.
+
 Run as CI runs it::
 
     cd python_api_test && python test_rotary_embedding.py
@@ -234,6 +239,28 @@ def device_available():
         return False, "torch.sdaa.is_available() raised %r" % (exc,)
 
 
+def device_inputs(qkv, hq, hkv, d, padded):
+    if padded:
+        # Moving the slices separately would silently make them contiguous.
+        qkv_d = qkv.to("sdaa")
+        q_d, k_d = slices(qkv_d, hq, hkv, d)
+        assert q_d.stride() == k_d.stride() == ((hq + 2 * hkv) * d, 1)
+        return q_d, k_d, qkv_d
+    q, k = slices(qkv, hq, hkv, d)
+    return q.to("sdaa"), k.to("sdaa"), None
+
+
+def check_device_output(fail, gate, case, name, got, ref, mask):
+    neq = got.view(torch.int16) != ref.view(torch.int16)
+    bad = int((neq & ~mask).sum())
+    masked = int((neq & mask).sum())
+    md = float((got.float() - ref.float()).abs().max())
+    record(fail, gate=gate, case=case, tensor=name, bit_mismatch=int(neq.sum()),
+           bit_mismatch_unmasked=bad, bit_mismatch_in_denormal_mask=masked,
+           max_error="%.6e" % md, ok=(bad == 0))
+    return bad == 0
+
+
 def check_device_gate(fail):
     import tecoops
     all_ok = True
@@ -243,8 +270,7 @@ def check_device_gate(fail):
         ref_q, ref_k = reference_chain(q, k, cache, positions, hq, hkv, d)
         mask_q, mask_k = denormal_involved(q, k, cache, positions, hq, hkv, d)
 
-        q_d = q.to("sdaa")
-        k_d = k.to("sdaa")
+        q_d, k_d, _ = device_inputs(qkv, hq, hkv, d, padded)
         cache_d = cache.to("sdaa")
         pos_d = positions.to("sdaa")
         out_q = torch.empty((t, hq * d), dtype=HALF, device="sdaa")
@@ -255,15 +281,8 @@ def check_device_gate(fail):
         this = True
         for name, got_d, ref, mask in (("q", out_q, ref_q, mask_q),
                                        ("k", out_k, ref_k, mask_k)):
-            got = got_d.cpu()
-            neq = got.view(torch.int16) != ref.view(torch.int16)
-            bad = int((neq & ~mask).sum())
-            masked = int((neq & mask).sum())
-            md = float((got.float() - ref.float()).abs().max())
-            this = this and bad == 0
-            record(fail, gate="device", case=tag, tensor=name, bit_mismatch_unmasked=bad,
-                   bit_mismatch_in_denormal_mask=masked, max_error="%.6e" % md,
-                   ok=(bad == 0))
+            good = check_device_output(fail, "device", tag, name, got_d.cpu(), ref, mask)
+            this = this and good
         all_ok = all_ok and this
     return all_ok
 
@@ -271,22 +290,53 @@ def check_device_gate(fail):
 def check_inplace_and_rejection(fail):
     import tecoops
     ok = True
-    # in-place against a padded fused-QKV slice
-    t, hq, hkv, d = 7, 16, 2, 128
-    qkv, cache, positions = make_case(t, hq, hkv, d, 31, padded=True)
-    q_out, k_out = slices(qkv, hq, hkv, d)
-    ref_q, ref_k = reference_chain(q_out, k_out, cache, positions, hq, hkv, d)
-    q_d = q_out.to("sdaa")
-    k_d = k_out.to("sdaa")
-    tecoops.rotary_embedding(q_d, k_d, cache.to("sdaa"), positions.to("sdaa"),
-                             q_d, k_d, True)
-    torch.sdaa.synchronize()
-    bad = int((q_d.cpu().view(torch.int16) != ref_q.view(torch.int16)).sum())
-    bad += int((k_d.cpu().view(torch.int16) != ref_k.view(torch.int16)).sum())
-    record(fail, gate="inplace", shape="T=7 padded fused-QKV", bit_mismatch=bad, ok=(bad == 0))
-    ok = ok and bad == 0
+    # Keep the original failing seed, and cover all device geometries in-place.
+    inplace_cases = CASES + [
+        ("CI seed=31 T=7 Hq=16 Hkv=2 D=128 padded-fused-QKV",
+         7, 16, 2, 128, True, 31, 1.0),
+    ]
+    for tag, t, hq, hkv, d, padded, seed, scale in inplace_cases:
+        qkv, cache, positions = make_case(t, hq, hkv, d, seed, padded, scale)
+        q, k = slices(qkv, hq, hkv, d)
+        ref_q, ref_k = reference_chain(q, k, cache, positions, hq, hkv, d)
+        mask_q, mask_k = denormal_involved(q, k, cache, positions, hq, hkv, d)
+        q_d, k_d, qkv_d = device_inputs(qkv, hq, hkv, d, padded)
+        cache_d, pos_d = cache.to("sdaa"), positions.to("sdaa")
+        out_q = torch.empty((t, hq * d), dtype=HALF, device="sdaa")
+        out_k = torch.empty((t, hkv * d), dtype=HALF, device="sdaa")
+        # The inputs are identical for both calls; the first must not mutate them.
+        tecoops.rotary_embedding(q_d, k_d, cache_d, pos_d, out_q, out_k, True)
+        torch.sdaa.synchronize()
+        for name, got_d, original in (("q", q_d, q), ("k", k_d, k)):
+            bad = int((got_d.cpu().view(torch.int16) != original.view(torch.int16)).sum())
+            record(fail, gate="outplace_input", case=tag, tensor=name,
+                   bit_mismatch=bad, ok=(bad == 0))
+            ok = ok and bad == 0
+
+        tecoops.rotary_embedding(q_d, k_d, cache_d, pos_d, q_d, k_d, True)
+        torch.sdaa.synchronize()
+        for name, got_d, out_d, ref, mask in (("q", q_d, out_q, ref_q, mask_q),
+                                             ("k", k_d, out_k, ref_k, mask_k)):
+            got, out = got_d.cpu(), out_d.cpu()
+            bad = int((got.view(torch.int16) != out.view(torch.int16)).sum())
+            # No subnormal mask here: aliases must match device output exactly.
+            record(fail, gate="inplace", case=tag, tensor=name,
+                   row_stride=got_d.stride(0), bit_mismatch=bad, ok=(bad == 0))
+            ok = ok and bad == 0
+            good = check_device_output(fail, "inplace_cpu", tag, name, got, ref, mask)
+            ok = ok and good
+            good = check_device_output(fail, "outplace_cpu", tag, name, out, ref, mask)
+            ok = ok and good
+        if qkv_d is not None:
+            v = qkv_d.cpu()[:, (hq + hkv) * d:]
+            original_v = qkv[:, (hq + hkv) * d:]
+            bad = int((v.view(torch.int16) != original_v.view(torch.int16)).sum())
+            record(fail, gate="inplace_v_untouched", case=tag,
+                   bit_mismatch=bad, ok=(bad == 0))
+            ok = ok and bad == 0
 
     # contract rejections: the wrapper must fail closed, never silently rotate
+    hq, hkv, d = 16, 2, 128
     q = torch.zeros((2, hq * d), dtype=HALF, device="sdaa")
     k = torch.zeros((2, hkv * d), dtype=HALF, device="sdaa")
     cache_d = cache.to("sdaa")
