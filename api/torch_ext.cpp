@@ -126,7 +126,7 @@ torch::Tensor linear_stream_torch(torch::Tensor x, torch::Tensor weight,
 
     if (single_row && x.scalar_type() == at::kHalf &&
         weight.scalar_type() == at::kHalf && x.is_contiguous() &&
-        weight.is_contiguous() && (n % 256 == 0) && (k % 16 == 0)) {
+        weight.is_contiguous() && (n % 64 == 0) && (k % 16 == 0)) {
         auto out = torch::empty({n}, x.options());
         tecoopsHandle_t handle = getGlobalHandle();
         tecoopsSetStream(handle, torch::sdaa::getCurrentSDAAStream());

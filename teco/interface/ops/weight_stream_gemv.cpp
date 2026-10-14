@@ -36,9 +36,14 @@ using tecoops::ual::args::WeightStreamGemvPatchArgs;
 using tecoops::ual::ops::WeightStreamGemvOp;
 
 // The kernel splits N into 32 contiguous row blocks and flushes each core's
-// output with one DMA, so it needs 16 B aligned block starts/sizes.  Gemma-4's
-// decode shapes all satisfy N % 256 == 0 and K % 16 == 0; anything else is
-// rejected here (fail-closed) rather than silently mis-DMAed.
+// output with one DMA of my_rows halfs, so every DMA size and address must be
+// 4 B aligned (the engine's own check_memcpy_async() masks address and size with
+// 3; see the MemcpyAsyncStatus enum in sdaa_memcpy.h).  my_rows = N/32, so the
+// flush is 4 B aligned exactly when N % 64 == 0, and each core's destination
+// offset is a multiple of N/16 bytes.  The activation fetch and the weight slabs
+// only need K % 16 == 0.  Anything else is rejected here (fail-closed) rather
+// than silently mis-DMAed; the 16 B claim that used to be in this comment is not
+// supported by the engine's validator.
 static tecoopsStatus_t checkWeightStreamGemvInput(tecoopsHandle_t handle,
                                                   const void *x, const void *w,
                                                   void *y, int n, int k) {
