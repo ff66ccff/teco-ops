@@ -56,7 +56,7 @@ static tecoopsStatus_t checkWeightStreamGemvInput(tecoopsHandle_t handle,
     if (n <= 0 || k <= 0) {
         return TECOOPS_STATUS_BAD_PARAM;
     }
-    if (n % 256 != 0 || k % 16 != 0) {
+    if (n % 64 != 0 || k % 16 != 0) {
         return TECOOPS_STATUS_BAD_PARAM;
     }
     return TECOOPS_STATUS_SUCCESS;
