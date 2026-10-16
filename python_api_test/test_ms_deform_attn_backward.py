@@ -175,9 +175,12 @@ def cpu_wrapper_contract():
     native = types.ModuleType(package + "._torch_ext")
     def forbidden(*args):
         raise AssertionError("unexpected native call in CPU wrapper check")
-    for name in ("flatten_rays", "morton3D_invert", "reshape_and_cache", "rms_norm",
-                 "flash_attn_varlen_func", "causal_conv1d_fn_torch", "ms_deform_attn_forward"):
-        setattr(native, name, forbidden)
+    # Absorb any name the package imports instead of mirroring a frozen identity list.  The from-list
+    # in api/tecoops/__init__.py grows whenever api/torch_ext.cpp gains an m.def binding, and a
+    # hardcoded table turns every such addition into an ImportError here even though the new binding
+    # is unrelated to MSDA.  Module-level __getattr__ (PEP 562) is consulted only after normal
+    # attribute lookup fails, so the explicit ms_deform_attn_backward mock installed below still wins.
+    native.__getattr__ = lambda name: forbidden
     captured = []
     def backward_mock(*args):
         captured.append(args)
