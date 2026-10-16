@@ -173,8 +173,40 @@ __global__ void teco_slave_weight_stream_gemv(WeightStreamGemvArgs args) {
 
         for (int s = 0; s < rows; ++s) {
             const half *wr = wbuf[cur] + static_cast<size_t>(s) * K;
-            floatv16 acc = simd_vcpyfs(0.0f);
+            // IVL-c31-W: four independent fp32 accumulator chains.  The delivered
+            // single chain is a serial dependency of K/16 simd_vfmas per row whose
+            // latency is not covered by the slab DMA, which is why the kernel
+            // measures 91.2 GB/s on the InternVL decode shapes while its own
+            // header quotes 92-197 GB/s for a pure streaming read of the same
+            // bytes.  Four chains shorten the exposed per-row dependency to K/64.
+            floatv16 acc0 = simd_vcpyfs(0.0f);
+            floatv16 acc1 = simd_vcpyfs(0.0f);
+            floatv16 acc2 = simd_vcpyfs(0.0f);
+            floatv16 acc3 = simd_vcpyfs(0.0f);
             int j = 0;
+            for (; j + 64 <= K; j += 64) {
+                float16v16 w0;
+                float16v16 x0;
+                float16v16 w1;
+                float16v16 x1;
+                float16v16 w2;
+                float16v16 x2;
+                float16v16 w3;
+                float16v16 x3;
+                simd_loadu(w0, wr + j);
+                simd_loadu(x0, xspm + j);
+                simd_loadu(w1, wr + j + 16);
+                simd_loadu(x1, xspm + j + 16);
+                simd_loadu(w2, wr + j + 32);
+                simd_loadu(x2, xspm + j + 32);
+                simd_loadu(w3, wr + j + 48);
+                simd_loadu(x3, xspm + j + 48);
+                acc0 = simd_vfmas(simd_vfcvths(x0), simd_vfcvths(w0), acc0);
+                acc1 = simd_vfmas(simd_vfcvths(x1), simd_vfcvths(w1), acc1);
+                acc2 = simd_vfmas(simd_vfcvths(x2), simd_vfcvths(w2), acc2);
+                acc3 = simd_vfmas(simd_vfcvths(x3), simd_vfcvths(w3), acc3);
+            }
+            floatv16 acc = simd_vfadds(simd_vfadds(acc0, acc1), simd_vfadds(acc2, acc3));
             for (; j + 16 <= K; j += 16) {
                 float16v16 hw;
                 float16v16 hx;
