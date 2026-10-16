@@ -617,19 +617,44 @@ __device__ __always_inline void flash_attention_half(FlashAttentionArgs args) {
                 }
                 float * outO = outc;            // reuse outc
                 int gemm_bn = 32;
-                for (int hb = 0; hb < BK / gemm_bn; hb++) {
-                    // V[:, hb*32 : hb*32+31] -> vbuf [cur_BN, gemm_bn] packed
-                    //   src: V[i][hb*32..hb*32+31] = cache[(i)*head_size + hb*32 .. +31]
-                    //   des: vbuf packed
-                    memcpy_stride(vbuf, v_cache_base + hb * gemm_bn,
-                                  cur_BN * gemm_bn * sizeof(half), gemm_bn * sizeof(half),
-                                  {0, (args.size_per_head - gemm_bn) * sizeof(half)});
+                // V-A: the per-panel strided V pack is issued one panel ahead on a MemcpyHandle
+                // and overlapped with the previous panel's PV GEMM.  The two panes live inside
+                // the same BN*BK-half staging buffer the synchronous code reuses panel by panel
+                // (BK/gemm_bn * BN*gemm_bn*2 B == BN*BK*2 B), so the SPM footprint does not
+                // change.  A pane is rewritten one iteration after its last reader, i.e. only
+                // after that iteration's wait_storeC(1) has retired the GEMM which consumed it
+                // (a C store cannot complete before the operands it consumed are in), so there
+                // is no read/write hazard.  The look-ahead of the last panel is clamped to a
+                // valid panel index - a redundant but well-formed DMA - instead of a zero-length
+                // one, and its handle is retired after the loop before ktmp is handed back to
+                // the K staging.  The loop body therefore stays branch-free (data-driven trip
+                // counts only) and the staged bytes are exactly those of the synchronous pack,
+                // so the panel payload the GEMM sees is bit-identical.
+                half *vbuf2 = vbuf + BN * gemm_bn;
+                const int npanel = BK / gemm_bn;
+                MemcpyHandle vh[2];
+                memcpy_async(vbuf, v_cache_base, cur_BN * gemm_bn * sizeof(half),
+                             gemm_bn * sizeof(half),
+                             {0, (args.size_per_head - gemm_bn) * sizeof(half)},
+                             MemcpyGlobalToSpm, vh[0]);
+                for (int hb = 0; hb < npanel; hb++) {
+                    half *pane = ((hb & 1) == 0) ? vbuf : vbuf2;
+                    half *nxt = ((hb & 1) == 0) ? vbuf2 : vbuf;
+                    memcpy_wait(vh[hb & 1]);
+                    // look one panel ahead; the clamp makes the last issue a redundant reload
+                    // of the last panel (valid DMA, no zero-length descriptor)
+                    {
+                        int hbn = MIN(hb + 1, npanel - 1);
+                        memcpy_async(nxt, v_cache_base + hbn * gemm_bn,
+                                     cur_BN * gemm_bn * sizeof(half), gemm_bn * sizeof(half),
+                                     {0, (args.size_per_head - gemm_bn) * sizeof(half)},
+                                     MemcpyGlobalToSpm, vh[(hb + 1) & 1]);
+                    }
 
-                    // clear unused rows of vbuf (cur_BN < BN)
-                    if (cur_BN < BN) {
-                        for (int r = cur_BN * gemm_bn; r < BN * gemm_bn; r++) {
-                            vbuf[r] = 0;
-                        }
+                    // clear unused rows of the consumed pane (cur_BN < BN); zero trip count
+                    // when cur_BN == BN
+                    for (int r = cur_BN * gemm_bn; r < BN * gemm_bn; r++) {
+                        pane[r] = 0;
                     }
 
                     MatmulConfig cfg;
@@ -639,7 +664,7 @@ __device__ __always_inline void flash_attention_half(FlashAttentionArgs args) {
                         gemm_m2 = cur_BM;
                     }
                     auto tP = make_tensor<2>(p_score, {(size_t)gemm_m2, (size_t)BN});
-                    auto tV = make_tensor<2>(vbuf, {(size_t)BN, (size_t)gemm_bn});
+                    auto tV = make_tensor<2>(pane, {(size_t)BN, (size_t)gemm_bn});
                     auto tO = make_tensor<2>((float *)outO, {(size_t)gemm_m2, (size_t)gemm_bn});
                     matmul.compute_async<MatmulBlockConfig::M128_N32>(tP, tV, true);
                     matmul.storeC_spm_async(tO);
@@ -664,6 +689,7 @@ __device__ __always_inline void flash_attention_half(FlashAttentionArgs args) {
                         }
                     }
                 }
+                memcpy_wait(vh[npanel & 1]);
 
                 // swap pointer
                 float *tmp = l_ptr; l_ptr = l_next; l_next = tmp;
