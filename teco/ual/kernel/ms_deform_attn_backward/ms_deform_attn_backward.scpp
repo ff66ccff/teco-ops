@@ -275,11 +275,26 @@ __device__ void value_list_reduce(MsDeformAttnBackwardArgs args) {
         float sum[128];
         for (int dim = 0; dim < dims; ++dim) sum[dim] = 0.0f;
         int32_t node = args.value_heads[owner];
+        // T1: shorten the reduce-stage dependency chain. Both edits are pure
+        // load re-orderings, so the arithmetic, its order and its rounding are
+        // untouched and grad_value stays bit-identical:
+        //   (1) the successor link is fetched before the per-node work, so its
+        //       global-load latency overlaps that work instead of sitting alone
+        //       on the critical path. value_next[] is fully published by the
+        //       previous launch, so the early read sees the same value;
+        //   (2) go_record is a pure function of go_owner and grad_output is
+        //       read-only here, so a repeat of the same row reuses the staged
+        //       record instead of re-issuing the blocking copy.
+        size_t go_cached = static_cast<size_t>(-1);
         while (node != -1) {
+            const int32_t next = args.value_next[node];
             const size_t sample = static_cast<size_t>(node) / 4;
             const size_t go_owner = sample / samples_per_owner;
-            ::memcpy(go_record, grad_output + go_owner * dims,
-                     static_cast<size_t>(dims) * sizeof(T));
+            if (go_owner != go_cached) {
+                ::memcpy(go_record, grad_output + go_owner * dims,
+                         static_cast<size_t>(dims) * sizeof(T));
+                go_cached = go_owner;
+            }
             const float aw = load_scalar(weights, sample);
             const float wx = args.node_wx[node];
             const float wy = args.node_wy[node];
@@ -290,7 +305,7 @@ __device__ void value_list_reduce(MsDeformAttnBackwardArgs args) {
                 volatile float contribution = ((go * aw) * wx) * wy;
                 sum[dim] += contribution;
             }
-            node = args.value_next[node];
+            node = next;
         }
         for (int dim = 0; dim < dims; ++dim) {
             args.grad_value[owner * dims + dim] = sum[dim];
