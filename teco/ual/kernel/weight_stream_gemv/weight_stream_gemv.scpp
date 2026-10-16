@@ -60,6 +60,19 @@ namespace {
 // kernel already holds ~450 KB, so 192 KB is deliberately conservative.
 constexpr size_t WSG_SPM_BUDGET = 192 * 1024;
 constexpr int WSG_SLAB_MAX = 32;
+
+// Fail-loud SPM allocation.  rt_spm_malloc() (ual/com/rt.h:56-73)
+// is a statement expression that *prints and then returns from the function it
+// is expanded in* when the request does not fit, so a null test at the kernel
+// call site can never run: the kernel exits with the output buffer untouched
+// while the host still sees a successful launch (cycle-27 H-1: 140288/140288
+// outputs stayed at their sentinel values and 903648 "spm malloc failed" lines
+// were the only trace).  Expanding the macro inside this helper turns that early
+// exit into a visible nullptr.  The success path is unchanged: same allocator,
+// same arguments, same returned pointer.
+__device__ void wsg_spm_try_alloc(size_t need, char **out) {
+    *out = static_cast<char *>(rt_spm_malloc(need));
+}
 }  // namespace
 
 __global__ void teco_slave_weight_stream_gemv(WeightStreamGemvArgs args) {
@@ -102,8 +115,21 @@ __global__ void teco_slave_weight_stream_gemv(WeightStreamGemvArgs args) {
     // inner loop.  fp16 -> fp32 is exact, so the arithmetic is unchanged.
     const size_t x_bytes = static_cast<size_t>(K) * sizeof(half);
     const size_t need = x_bytes + 2 * slab_bytes + y_bytes + 256;
-    char *spm_base = static_cast<char *>(rt_spm_malloc(need));
-    if (spm_base == nullptr) return;
+    char *spm_base = nullptr;
+    wsg_spm_try_alloc(need, &spm_base);
+    if (spm_base == nullptr) {
+        // Refuse to let a buffer this kernel never wrote look like a result.
+        // ai_printf names the cause; the rcsr below is the very RAISE_EXCEPTION
+        // the delivered rt.h already uses for SPM overflow (CHECK_SPM_OVERFLOW is
+        // on by default, ual/com/rt.h:30), so an out-of-SPM configuration kills
+        // the process loudly instead of returning all-wrong numerics with rc=0.
+        ai_printf("[weight_stream_gemv] FATAL: SPM malloc failed: need=%lu "
+                  "(n=%d k=%d my_rows=%d slab=%d)\n",
+                  static_cast<unsigned long>(need), N, K, my_rows, slab);
+        unsigned int spm_fault_tmp;
+        asm volatile("rcsr %0,5\n" : "=&r"(spm_fault_tmp)::"memory");
+        return;
+    }
 
     char *cur = spm_base;
     cur += (64 - (reinterpret_cast<unsigned long>(cur) & 63UL)) & 63UL;
