@@ -72,6 +72,19 @@ int findFlashAttentionBranch(const FlashAttentionPatchArgs *args) {
         return 2;
     }
 
+    // ALGO0 (teco_slave_flash_attention_half -> flash_attention_half<128>): the kernel hard-codes
+    // `int BN = 32;  // N block, 32 for ace; block_size` and derives the paged K/V block index as
+    // `int cur_block = j / args.block_size;  // BN == block_size`, so the page stride it addresses
+    // is only the tile stride when block_size == 32.  Any other block_size silently reads the
+    // wrong pages instead of failing.  This point is reached only when head_dim is neither 256 nor
+    // 512 (both returned above), i.e. exactly the ALGO0 dispatch; -1 keeps the existing
+    // fail-closed convention and makes findImpl() return Status::NOT_IMPLEMENTED.
+    if (args->rvargs->block_size != 32) {
+        ERROR("flash_attention ALGO0 needs block_size == 32, got %d\n",
+              args->rvargs->block_size);
+        return -1;
+    }
+
     int algo = 0;
     // teco_slave_flash_attention_half
     return algo;
