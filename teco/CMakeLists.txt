@@ -72,6 +72,26 @@ file(GLOB_RECURSE SRC_UAL_COMMON "${OPS_DIR}/ual/com/*.cpp")
 file(GLOB_RECURSE SRC_UAL_OPS "${OPS_DIR}/ual/ops/*/*.cpp")
 file(GLOB_RECURSE SRC_UAL_KERNEL "${OPS_DIR}/ual/kernel/*/*.scpp")
 
+# [c37 ops-tax TAX-1] The device-code section order inside .sdaa_fatbin equals the ORDER OF THE
+# OBJECT FILES ON THE OFFICIAL LINK LINE (tecocc $<TARGET_OBJECTS:ops_objs> -flto ... --sdaa-link),
+# which equals the target source-list order.  Measured byte-level on build root
+# /root/tmpwork/c37/lead/ops-base @7ea7e84: permuting only the object order on the link command
+# moves weight_stream_gemv's .aitext VMA 0x26418 (base) -> 0x25998 / 0x0cd68 / 0x2f0d4.
+# This is the link-stage lever that c35 F1 ("link-time levers are all dead") did NOT test: F1
+# swept section-attribute flags (--sort-section / --section-start / -falign-functions), not the
+# input object order.  Evidence: /root/tmpwork/c37/ops-tax/RESULT.md sec.1 + arms/layout-*.txt.
+# Pin weight_stream_gemv's device code immediately BEFORE rotary_embedding so that its .aitext
+# VMA becomes 0x25998 -- the 128-byte-line neighbour of the only measured "fast" address 0x259dc
+# (c33 window: lib-W-FAST2.so AHT 0.0041612 vs lib-A-asis.so 0x26418 AHT 0.0071927).
+# Collateral is one section: rotary_embedding moves 0x25998 -> 0x267fc; every other section keeps
+# its base VMA (proved by relink: arms/layout-before_rotary.txt).
+list(FIND SRC_UAL_KERNEL "${OPS_DIR}/ual/kernel/weight_stream_gemv/weight_stream_gemv.scpp" _TAX1_WSG)
+list(FIND SRC_UAL_KERNEL "${OPS_DIR}/ual/kernel/rotary_embedding/rotary_embedding_fp16.scpp" _TAX1_ROT)
+if(_TAX1_WSG GREATER -1 AND _TAX1_ROT GREATER -1 AND _TAX1_WSG GREATER _TAX1_ROT)
+    list(REMOVE_AT SRC_UAL_KERNEL ${_TAX1_WSG})
+    list(INSERT SRC_UAL_KERNEL ${_TAX1_ROT} "${OPS_DIR}/ual/kernel/weight_stream_gemv/weight_stream_gemv.scpp")
+endif()
+
 list(APPEND SRC_ALL
     ${SRC_INTERFACE_COMMON}
     ${SRC_INTERFACE_OPS}
