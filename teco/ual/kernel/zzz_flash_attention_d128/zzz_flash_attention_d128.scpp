@@ -674,7 +674,16 @@ __device__ __always_inline void flash_attention_half(FlashAttentionArgs args) {
                 }
 
                 // Step B: o_accum: O *= exp(m_old - m_new)
-                for (int ri = 0; ri < cur_BM; ri++) {
+                // [c39 P5 MCP-c39-1] On the FIRST KV tile of a Q block this pass is a
+                // provable no-op: o_accum was zeroed for this block just above (BM*BK
+                // f32 stores) and scale[ri] = expf(m_prev - m_new) with m_prev = -inf
+                // (fill_inf) and m_new finite for every live row - KV index j = 0 is
+                // causally allowed for row r because (k_seq_len - q_seq_len) + i + r + 1 >= 1 -
+                // so scale == expf(-inf) == 0 and the pass stores 0 over 0.  The bound is a
+                // per-tile TRIP COUNT (a select, not a branch); the loop body, the element
+                // arithmetic and every live row's rounding are untouched.
+                const int rescale_end = (j == 0) ? 0 : cur_BM;
+                for (int ri = 0; ri < rescale_end; ri++) {
                     float s = scale[ri];
                     if constexpr (BM == 32 || BM == 64 || BM == 128) {
                         floatv16 vscale = s;
