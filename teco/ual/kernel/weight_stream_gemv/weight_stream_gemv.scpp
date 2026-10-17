@@ -243,7 +243,9 @@ __global__ void teco_slave_weight_stream_gemv(WeightStreamGemvArgs args) {
     MemcpyHandle put;
     memcpy_async(y_hbm + row0, yout, y_bytes, MemcpySpmToGlobal, put);
     memcpy_wait(put);
-    memcpy_wait(get[0]);
-    memcpy_wait(get[1]);
+    // [c36-hy3] the two trailing slab waits are redundant: every issued get was
+    // already waited at the top of its loop iteration, and when the core owns a
+    // single slab get[1] was never issued at all (cold handle).  Removing them
+    // cannot change the data path; it only drops two sync calls.
     rt_spm_free(spm_base);
 }
