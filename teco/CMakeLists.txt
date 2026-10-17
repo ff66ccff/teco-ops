@@ -92,6 +92,31 @@ if(_TAX1_WSG GREATER -1 AND _TAX1_ROT GREATER -1 AND _TAX1_WSG GREATER _TAX1_ROT
     list(INSERT SRC_UAL_KERNEL ${_TAX1_ROT} "${OPS_DIR}/ual/kernel/weight_stream_gemv/weight_stream_gemv.scpp")
 endif()
 
+# [c38 R10] Device-section order guard (build-time only; no hot-path effect).  Targets, measured in the
+# cycle-38 windows: weight_stream_gemv -> 0x25a08 (wsg case_0 -31.0%), rotary_embedding -> 0x28858
+# (rotary c0/c1/c2 -57.8%/-38.5%/-56.4%), zzz_flash_attention_d128 -> 0x2a878 (flash case_0 -2.41%).
+# Same shape as the cycle-37 TAX-1 block: explicit FIND/REMOVE_AT/INSERT, idempotent, existence-guarded.
+macro(_c38_r10_move_before _obj _anchor)
+    list(FIND SRC_UAL_KERNEL "${_obj}" _oi)
+    list(FIND SRC_UAL_KERNEL "${_anchor}" _ai)
+    if(_oi GREATER -1 AND _ai GREATER -1 AND NOT _oi EQUAL _ai)
+        list(REMOVE_AT SRC_UAL_KERNEL ${_oi})
+        if(_oi LESS _ai)
+            math(EXPR _ai "${_ai} - 1")
+        endif()
+        list(INSERT SRC_UAL_KERNEL ${_ai} "${_obj}")
+    endif()
+endmacro()
+set(_R10K "${OPS_DIR}/ual/kernel")
+# 1) A3 relation: weight_stream_gemv immediately before rms_norm_compat (this is what makes rotary fast)
+_c38_r10_move_before("${_R10K}/weight_stream_gemv/weight_stream_gemv.scpp" "${_R10K}/rms_norm_compat/rms_norm_compat.scpp")
+# 2) flash_d128 before the msdeform span TU   3) rac-dma before flash   4) bwd-gather before flash
+_c38_r10_move_before("${_R10K}/zzz_flash_attention_d128/zzz_flash_attention_d128.scpp" "${_R10K}/z_ms_deform_attn_forward_span/z_ms_deform_attn_forward_span.scpp")
+_c38_r10_move_before("${_R10K}/z_reshape_and_cache_dma/reshape_and_cache_dma.scpp" "${_R10K}/zzz_flash_attention_d128/zzz_flash_attention_d128.scpp")
+_c38_r10_move_before("${_R10K}/zz_ms_deform_attn_backward_ha/zz_ms_deform_attn_backward_ha.scpp" "${_R10K}/zzz_flash_attention_d128/zzz_flash_attention_d128.scpp")
+# 5) bwd-gather before weight_stream_gemv => wsg 0x25a08 and rotary 0x28858
+_c38_r10_move_before("${_R10K}/zz_ms_deform_attn_backward_ha/zz_ms_deform_attn_backward_ha.scpp" "${_R10K}/weight_stream_gemv/weight_stream_gemv.scpp")
+
 list(APPEND SRC_ALL
     ${SRC_INTERFACE_COMMON}
     ${SRC_INTERFACE_OPS}
