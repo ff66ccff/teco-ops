@@ -175,7 +175,7 @@ static __device__ __always_inline void online_softmax_panel_T(
     float *cst, int r0, int cur_M, int cur_BN,
     const float *pre_max, const float *pre_sum,
     float *cur_max, float *cur_sum, float *scale,
-    half *p_score, int BN) {
+    half *p_score, int BN, int off) {
     floatv16 vmax0 = -FLT_MAX, vmax1 = -FLT_MAX;
     for (int t = 0; t < cur_BN; t++) {
         floatv16 lo, hi;
@@ -215,8 +215,14 @@ static __device__ __always_inline void online_softmax_panel_T(
         floatv16 lo, hi;
         simd_load(lo, cst + t * 32);
         simd_load(hi, cst + t * 32 + 16);
-        lo = simd_exp(lo - nm0);
-        hi = simd_exp(hi - nm1);
+        // [c36-MASKSKIP] A 16-lane vector whose lanes are all causally masked holds only
+        // -inf, and exp(-inf - m) is exactly 0 whenever the running max m is finite - which
+        // the first KV tile always guarantees, because key 0 is visible to every query, so
+        // pre_max is finite from tile 1 on.  Skipping the exp and recording 0 is therefore
+        // bit-identical: the same half reaches p_score and the same 0 is added to the sum.
+        const int need = t - off;
+        lo = (need < r0 + 16) ? simd_exp(lo - nm0) : (floatv16)0.0f;
+        hi = (need < r0 + 32) ? simd_exp(hi - nm1) : (floatv16)0.0f;
         vsum0 = vsum0 + lo;
         vsum1 = vsum1 + hi;
         // [c36-SOFTP] P^T -> P fused into this pass: the exp result is already in
@@ -454,10 +460,8 @@ __device__ __always_inline void flash_attention_half(FlashAttentionArgs args) {
                         // r <= min(t - off - 1, cur_BN - off - 2) with off = q_start + i - j,
                         // which is exactly the element set apply_causal_mask() builds on
                         // S[cur_BM, BN].
+                        const int off = ({ int qs = k_seq_len - q_seq_len; qs < 0 ? 0 : qs; }) + i - j;
                         {
-                            int q_start = k_seq_len - q_seq_len;
-                            if (q_start < 0) q_start = 0;
-                            int off = q_start + i - j;
                             int lim = cur_BN - off - 2;
                             for (int t = 0; t < cur_BN; t++) {
                                 int rmax = t - off - 1;
@@ -473,7 +477,7 @@ __device__ __always_inline void flash_attention_half(FlashAttentionArgs args) {
                         // it also emits P into p_score, so no separate transpose loop follows.
                         online_softmax_panel_T(cst, r0, cur_BM, cur_BN,
                                                m_ptr, l_ptr, m_next, l_next, scale,
-                                               p_score, BN);
+                                               p_score, BN, off);
 
                         // [c36-SOFTP] The live columns of P were already written by
                         // online_softmax_panel_T; only the padded columns [cur_BN, BN) that
