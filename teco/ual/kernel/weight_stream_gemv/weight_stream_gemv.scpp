@@ -97,7 +97,7 @@ __global__ void teco_slave_weight_stream_gemv(WeightStreamGemvArgs args) {
     const size_t row_bytes = static_cast<size_t>(K) * sizeof(half);
     const size_t y_bytes = static_cast<size_t>(my_rows) * sizeof(half);
 
-    int slab = static_cast<int>((WSG_SPM_BUDGET - 4 * static_cast<size_t>(K) - y_bytes) /
+    int slab = static_cast<int>((WSG_SPM_BUDGET - 6 * static_cast<size_t>(K) - y_bytes) /
                                 (2 * row_bytes));
     if (slab < 1) slab = 1;
     if (slab > WSG_SLAB_MAX) slab = WSG_SLAB_MAX;
@@ -114,7 +114,12 @@ __global__ void teco_slave_weight_stream_gemv(WeightStreamGemvArgs args) {
     // keeps the activation row in fp16 in SPM and converts both operands in the
     // inner loop.  fp16 -> fp32 is exact, so the arithmetic is unchanged.
     const size_t x_bytes = static_cast<size_t>(K) * sizeof(half);
-    const size_t need = x_bytes + 2 * slab_bytes + y_bytes + 256;
+    // [c36-variantA] The activation row is converted to fp32 ONCE below, so the
+    // per-row inner loop drops one of its two vfcvths per 16 lanes.  The fp32
+    // operands and the reduction order are unchanged (fp16 -> fp32 is exact),
+    // so this is a pure instruction-count reduction.
+    const size_t x32_bytes = static_cast<size_t>(K) * sizeof(float);
+    const size_t need = x_bytes + x32_bytes + 2 * slab_bytes + y_bytes + 256;
     char *spm_base = nullptr;
     wsg_spm_try_alloc(need, &spm_base);
     if (spm_base == nullptr) {
@@ -135,6 +140,8 @@ __global__ void teco_slave_weight_stream_gemv(WeightStreamGemvArgs args) {
     cur += (64 - (reinterpret_cast<unsigned long>(cur) & 63UL)) & 63UL;
     half *xspm = reinterpret_cast<half *>(cur);
     cur += x_bytes;
+    float *xspm32 = reinterpret_cast<float *>(cur);
+    cur += x32_bytes;
     half *wbuf0 = reinterpret_cast<half *>(cur);
     cur += slab_bytes;
     half *wbuf1 = reinterpret_cast<half *>(cur);
@@ -148,6 +155,18 @@ __global__ void teco_slave_weight_stream_gemv(WeightStreamGemvArgs args) {
         MemcpyHandle hx;
         memcpy_async(xspm, x_hbm, x_bytes, MemcpyGlobalToSpm, hx);
         memcpy_wait(hx);
+    }
+
+    // [c36-variantA] widen the activation row to fp32 exactly once; the inner
+    // loop then loads fp32 lanes directly instead of re-converting per row.
+    {
+        int j = 0;
+        for (; j + 16 <= K; j += 16) {
+            float16v16 hx;
+            simd_loadu(hx, xspm + j);
+            simd_store(simd_vfcvths(hx), xspm32 + j);
+        }
+        for (; j < K; ++j) xspm32[j] = static_cast<float>(xspm[j]);
     }
 
     MemcpyHandle get[2];
@@ -186,36 +205,36 @@ __global__ void teco_slave_weight_stream_gemv(WeightStreamGemvArgs args) {
             int j = 0;
             for (; j + 64 <= K; j += 64) {
                 float16v16 w0;
-                float16v16 x0;
+                floatv16 x0;
                 float16v16 w1;
-                float16v16 x1;
+                floatv16 x1;
                 float16v16 w2;
-                float16v16 x2;
+                floatv16 x2;
                 float16v16 w3;
-                float16v16 x3;
+                floatv16 x3;
                 simd_loadu(w0, wr + j);
-                simd_loadu(x0, xspm + j);
+                simd_load(x0, xspm32 + j);
                 simd_loadu(w1, wr + j + 16);
-                simd_loadu(x1, xspm + j + 16);
+                simd_load(x1, xspm32 + j + 16);
                 simd_loadu(w2, wr + j + 32);
-                simd_loadu(x2, xspm + j + 32);
+                simd_load(x2, xspm32 + j + 32);
                 simd_loadu(w3, wr + j + 48);
-                simd_loadu(x3, xspm + j + 48);
-                acc0 = simd_vfmas(simd_vfcvths(x0), simd_vfcvths(w0), acc0);
-                acc1 = simd_vfmas(simd_vfcvths(x1), simd_vfcvths(w1), acc1);
-                acc2 = simd_vfmas(simd_vfcvths(x2), simd_vfcvths(w2), acc2);
-                acc3 = simd_vfmas(simd_vfcvths(x3), simd_vfcvths(w3), acc3);
+                simd_load(x3, xspm32 + j + 48);
+                acc0 = simd_vfmas(x0, simd_vfcvths(w0), acc0);
+                acc1 = simd_vfmas(x1, simd_vfcvths(w1), acc1);
+                acc2 = simd_vfmas(x2, simd_vfcvths(w2), acc2);
+                acc3 = simd_vfmas(x3, simd_vfcvths(w3), acc3);
             }
             floatv16 acc = simd_vfadds(simd_vfadds(acc0, acc1), simd_vfadds(acc2, acc3));
             for (; j + 16 <= K; j += 16) {
                 float16v16 hw;
-                float16v16 hx;
+                floatv16 hx;
                 simd_loadu(hw, wr + j);
-                simd_loadu(hx, xspm + j);
-                acc = simd_vfmas(simd_vfcvths(hx), simd_vfcvths(hw), acc);
+                simd_load(hx, xspm32 + j);
+                acc = simd_vfmas(hx, simd_vfcvths(hw), acc);
             }
             float dot = simd_redsum(acc);
-            for (; j < K; ++j) dot += static_cast<float>(wr[j]) * static_cast<float>(xspm[j]);
+            for (; j < K; ++j) dot += static_cast<float>(wr[j]) * xspm32[j];
             yout[s0 + s] = static_cast<half>(dot);
         }
     }
