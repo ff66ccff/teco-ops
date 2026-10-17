@@ -117,6 +117,16 @@ _c38_r10_move_before("${_R10K}/zz_ms_deform_attn_backward_ha/zz_ms_deform_attn_b
 # 5) bwd-gather before weight_stream_gemv => wsg 0x25a08 and rotary 0x28858
 _c38_r10_move_before("${_R10K}/zz_ms_deform_attn_backward_ha/zz_ms_deform_attn_backward_ha.scpp" "${_R10K}/weight_stream_gemv/weight_stream_gemv.scpp")
 
+# [c39 R17] joint order arm: SWAP weight_stream_gemv and the bwd-gather TU.
+# Rationale (device-free search, 13 candidate orders, see _c39j17/joint-search-arms.json):
+#   wsg fast addresses are all BELOW its 60a40d7 address (0x25bb4) and the gather TU is its immediate
+#   predecessor, so lowering wsg necessarily displaces the gather -> "wsg fast AND gather at base" is
+#   unsatisfiable.  The swap is the minimum-collateral member of that frontier:
+#     wsg 0x25bb4 -> 0x23dd4 (measured fast class, -33%), gather 0x23dd4 -> 0x24d48,
+#     while flash_d128 (0x2ab34), rms_norm_fp16 (0x212a0), memset (0x151fc), msdeform_fwd (0x1aa08)
+#     keep their 60a40d7 addresses (unlike K3, which also moved flash_d128 by -2868).
+_c38_r10_move_before("${_R10K}/weight_stream_gemv/weight_stream_gemv.scpp" "${_R10K}/zz_ms_deform_attn_backward_ha/zz_ms_deform_attn_backward_ha.scpp")
+
 list(APPEND SRC_ALL
     ${SRC_INTERFACE_COMMON}
     ${SRC_INTERFACE_OPS}
