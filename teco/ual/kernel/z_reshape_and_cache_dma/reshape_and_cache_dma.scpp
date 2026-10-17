@@ -80,26 +80,27 @@ __global__ void teco_slave_reshape_and_cache_fp16_dma(ReshapeAndCacheArgs args) 
     const int row_bytes  = H * head_bytes;
     const size_t put_gap = (size_t)(head_stride - head_bytes);
 
-    // [c37-HY-RACP4] c36's pipeline only overlapped the LOADS: the put of token t was
-    // still issued and awaited inside the same iteration, so one store latency stayed
-    // fully exposed per token per core.  Two staging sets cannot fix that - the set a
-    // put reads is refilled on the very next iteration, so there is no room to defer
-    // the wait.  Four sets give two full iterations of room: at iteration it the set
-    // (it+2)&3 is refilled with the token it will hold at it+2, and the put that last
-    // read it was issued at it-2, so its latency is overlapped with two iterations of
-    // load/issue work.  Loads also gain a second iteration of slack (the set read at it
-    // was filled at it-2, not it-1).  Bytes, destinations and per-token order unchanged.
-    char *spm_key   = (char *)rt_spm_malloc(4 * (size_t)row_bytes);
-    char *spm_value = (char *)rt_spm_malloc(4 * (size_t)row_bytes);
-    char *spmk[4] = {spm_key, spm_key + row_bytes, spm_key + 2 * row_bytes,
-                     spm_key + 3 * row_bytes};
-    char *spmv[4] = {spm_value, spm_value + row_bytes, spm_value + 2 * row_bytes,
-                     spm_value + 3 * row_bytes};
+    // [c38-MCP-RACP4+] 542a2a1 gave both the LOAD and the PUT two iterations of slack
+    // (4 sets, look-ahead 2).  The exposed remainder is still a per-token stall on the
+    // small-H cases, so widen the window: 8 staging sets with a look-ahead of 4.
+    // Set index of iteration j is j & (STAGE-1); the set refilled at iteration it is
+    // (it+LOOKAHEAD)&(STAGE-1), which was last *read* by iteration it-(STAGE-LOOKAHEAD),
+    // so waiting on that set's put there gives the put 4 iterations of flight and the
+    // load 4.  Bytes, destinations and per-token order are unchanged.
+    constexpr int STAGE     = 8;   // power of two
+    constexpr int LOOKAHEAD = 4;
+    char *spm_key   = (char *)rt_spm_malloc(STAGE * (size_t)row_bytes);
+    char *spm_value = (char *)rt_spm_malloc(STAGE * (size_t)row_bytes);
+    char *spmk[STAGE];
+    char *spmv[STAGE];
+    for (int s = 0; s < STAGE; ++s) {
+        spmk[s] = spm_key   + (size_t)s * row_bytes;
+        spmv[s] = spm_value + (size_t)s * row_bytes;
+    }
 
-    MemcpyHandle get_key[4], get_value[4], put_key[4], put_value[4];
-    // Prime sets 0 and 1 with tokens tid and tid+32; sets 2 and 3 are filled by the
-    // first two iterations of the loop below (their put waits are cold and idle-safe).
-    for (int i = 0; i < 2; ++i) {
+    MemcpyHandle get_key[STAGE], get_value[STAGE], put_key[STAGE], put_value[STAGE];
+    // Prime sets 0..LOOKAHEAD-1; the loop below fills the rest (cold waits are idle-safe).
+    for (int i = 0; i < LOOKAHEAD; ++i) {
         const int t0 = tid + i * CORE_NUM;
         if (t0 < T) {
             const half *src_key0   = key   + (size_t)t0 * key_stride / sizeof(half);
@@ -111,9 +112,8 @@ __global__ void teco_slave_reshape_and_cache_fp16_dma(ReshapeAndCacheArgs args) 
 
     int it = 0;
     for (int t = tid; t < T; t += CORE_NUM, ++it) {
-        const int p = it & 3;          // set holding this token
-        const int r = (it + 2) & 3;    // set that will hold token t+64; its put was
-                                       // issued at it-2 and is still in flight now
+        const int p = it & (STAGE - 1);                    // set holding this token
+        const int r = (it + LOOKAHEAD) & (STAGE - 1);      // set refilled right below
 
         memcpy_wait(get_key[p]);
         memcpy_wait(get_value[p]);
@@ -134,12 +134,12 @@ __global__ void teco_slave_reshape_and_cache_fp16_dma(ReshapeAndCacheArgs args) 
                          {put_gap, 0}, MemcpySpmToGlobal, put_value[p]);
         }
 
-        // Drain the put that read set r (issued two iterations ago) and only then
-        // refill set r: this is the wait the two-set pipeline had to pay inline.
+        // Drain the put that last read set r (issued 4 iterations ago) and only then
+        // refill set r: this is exactly the wait that used to sit on the token path.
         memcpy_wait(put_key[r]);
         memcpy_wait(put_value[r]);
 
-        const int tn = t + 2 * CORE_NUM;
+        const int tn = t + LOOKAHEAD * CORE_NUM;
         if (tn < T) {
             const half *src_key_n   = key   + (size_t)tn * key_stride / sizeof(half);
             const half *src_value_n = value + (size_t)tn * value_stride / sizeof(half);
@@ -149,14 +149,10 @@ __global__ void teco_slave_reshape_and_cache_fp16_dma(ReshapeAndCacheArgs args) 
     }
 
     // Drain every outstanding store before the staging carve is released.
-    memcpy_wait(put_key[0]);
-    memcpy_wait(put_value[0]);
-    memcpy_wait(put_key[1]);
-    memcpy_wait(put_value[1]);
-    memcpy_wait(put_key[2]);
-    memcpy_wait(put_value[2]);
-    memcpy_wait(put_key[3]);
-    memcpy_wait(put_value[3]);
+    for (int s = 0; s < STAGE; ++s) {
+        memcpy_wait(put_key[s]);
+        memcpy_wait(put_value[s]);
+    }
     rt_spm_free(spm_key);
     rt_spm_free(spm_value);
 }
