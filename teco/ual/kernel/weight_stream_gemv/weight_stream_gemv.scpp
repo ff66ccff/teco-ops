@@ -102,6 +102,15 @@ __global__ void teco_slave_weight_stream_gemv(WeightStreamGemvArgs args) {
     if (slab < 1) slab = 1;
     if (slab > WSG_SLAB_MAX) slab = WSG_SLAB_MAX;
     if (slab > my_rows) slab = my_rows;
+    // [c39-HY-WSG-SPLIT] Both official cases end up with slab == my_rows, so the
+    // double-buffered loop below runs exactly ONE iteration and its prefetch branch
+    // never fires: the whole slab DMA is exposed in front of every core's compute.
+    // Capping the slab at half of the rows this core owns makes the loop run twice,
+    // so the second half of the weight rows is prefetched while the first half is
+    // being reduced.  Every row still scores against x with the identical ILP4 chain
+    // and the identical reduction order, and the activation row is untouched, so the
+    // stored bytes are unchanged - only the DMA/compute schedule moves.
+    if (slab > (my_rows + 1) / 2) slab = (my_rows + 1) / 2;
 
     const size_t slab_bytes = static_cast<size_t>(slab) * row_bytes;
     // One contiguous SPM block with a single rt_spm_malloc / rt_spm_free, the
