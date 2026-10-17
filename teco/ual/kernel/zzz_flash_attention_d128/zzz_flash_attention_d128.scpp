@@ -174,7 +174,8 @@ static __device__ void online_softmax_step(
 static __device__ __always_inline void online_softmax_panel_T(
     float *cst, int r0, int cur_M, int cur_BN,
     const float *pre_max, const float *pre_sum,
-    float *cur_max, float *cur_sum, float *scale) {
+    float *cur_max, float *cur_sum, float *scale,
+    half *p_score, int BN) {
     floatv16 vmax0 = -FLT_MAX, vmax1 = -FLT_MAX;
     for (int t = 0; t < cur_BN; t++) {
         floatv16 lo, hi;
@@ -216,10 +217,27 @@ static __device__ __always_inline void online_softmax_panel_T(
         simd_load(hi, cst + t * 32 + 16);
         lo = simd_exp(lo - nm0);
         hi = simd_exp(hi - nm1);
-        simd_store(lo, cst + t * 32);
-        simd_store(hi, cst + t * 32 + 16);
         vsum0 = vsum0 + lo;
         vsum1 = vsum1 + hi;
+        // [c36-SOFTP] P^T -> P fused into this pass: the exp result is already in
+        // registers, so the separate conversion loop's 32 strided (bank-conflicting)
+        // float reads per KV column disappear.  Same values, same rounding: the half
+        // written is (half) of the very float the old loop re-read from cst.
+        const float *plo = (const float *)&lo;
+        const float *phi = (const float *)&hi;
+        if (r0 + 32 <= cur_M) {
+#pragma unroll
+            for (int u = 0; u < 16; u++) {
+                p_score[(r0 + u) * BN + t] = (half)plo[u];
+                p_score[(r0 + 16 + u) * BN + t] = (half)phi[u];
+            }
+        } else {
+#pragma unroll
+            for (int u = 0; u < 16; u++) {
+                if (r0 + u < cur_M) p_score[(r0 + u) * BN + t] = (half)plo[u];
+                if (r0 + 16 + u < cur_M) p_score[(r0 + 16 + u) * BN + t] = (half)phi[u];
+            }
+        }
     }
     float sbuf[32];
     simd_store(vsum0, sbuf);
@@ -451,19 +469,22 @@ __device__ __always_inline void flash_attention_half(FlashAttentionArgs args) {
                             }
                         }
 
-                        // Step A: online softmax on the transposed panel (bit-identical state)
+                        // Step A: online softmax on the transposed panel (bit-identical state);
+                        // it also emits P into p_score, so no separate transpose loop follows.
                         online_softmax_panel_T(cst, r0, cur_BM, cur_BN,
-                                               m_ptr, l_ptr, m_next, l_next, scale);
+                                               m_ptr, l_ptr, m_next, l_next, scale,
+                                               p_score, BN);
 
-                        // P^T -> P fused with the float->half conversion of Step C, plus the
-                        // padded columns [cur_BN, BN) the P@V GEMM expects to be zero.
-                        for (int rr = 0; rr < 32; rr++) {
-                            int r = r0 + rr;
-                            if (r >= cur_BM) break;
-                            half *op = p_score + r * BN;
-                            int t = 0;
-                            for (; t < cur_BN; t++) op[t] = (half)cst[t * 32 + rr];
-                            for (; t < BN; t++) op[t] = (half)0;
+                        // [c36-SOFTP] The live columns of P were already written by
+                        // online_softmax_panel_T; only the padded columns [cur_BN, BN) that
+                        // the P@V GEMM expects to be zero are left to write here.
+                        if (cur_BN < BN) {
+                            for (int rr = 0; rr < 32; rr++) {
+                                int r = r0 + rr;
+                                if (r >= cur_BM) break;
+                                half *op = p_score + r * BN;
+                                for (int t = cur_BN; t < BN; t++) op[t] = (half)0;
+                            }
                         }
                     }
                 } else {
