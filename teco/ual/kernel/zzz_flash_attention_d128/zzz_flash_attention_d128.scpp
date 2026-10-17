@@ -307,6 +307,95 @@ __device__ __always_inline void flash_attention_half(FlashAttentionArgs args) {
     float *m_cur  = (float*)rt_spm_malloc(BM * sizeof(float));       // m  (new)
     float *scale  = (float*)rt_spm_malloc(BM * sizeof(float));       // exp(m_old - m_new)
     half *p_score = (half*)rt_spm_malloc(BM * BN * sizeof(half));    // BM * BN
+    // ---------------------------------------------------------------------------
+    // c38 cand-1 (schedule only): entry-time LPT assignment of Q blocks to parts.
+    //
+    // Shipped mapping: part p owns the blocks c = 0,1,2,... of *every* batch with
+    // c % parts == p (the i loop below).  The batch mix of the official D128 cases is
+    // [1, 256, 128] tokens, i.e. one 1-token block, two 128-token blocks and one
+    // 128-token block, so part 0 collects the 1-token and the last batch's block while
+    // part 1 gets a single block: the busiest SPE runs 2.5x the mean (measured tile
+    // weights 2576 vs the balanced 2048, -20.5%; case_1 2704 vs 2048, -24.3%).
+    //
+    // Fix: enumerate every (batch, Q block) pair once at entry, weight it by
+    //   W = ntiles * cur_BM   (ntiles is the causal KV-tile trip count of the loop
+    //   below, cur_BM the rows the score/PV GEMM really walks), and hand the blocks
+    //   to the parts longest-first / least-loaded-first (LPT).  The Q blocks are
+    //   independent - each keeps its own online-softmax state and writes disjoint
+    //   output rows - so this changes only which SPE runs which block; the arithmetic
+    //   and the device output are bit-identical.  The assignment is fixed once per
+    //   kernel call and read back as a per-batch index list: no branch is added to the
+    //   per-KV-tile loops.
+    // ---------------------------------------------------------------------------
+    int nblk_total = 0;
+    for (int b = 0; b < args.batch_size; b++) {
+        int qe = args.q_seq_lens[b];
+        if constexpr (BM == 32) {
+            qe -= qe % BM;
+        }
+        nblk_total += (qe + BM - 1) / BM;
+    }
+    int nel = 4 * nblk_total + args.batch_size + 1;
+    if (nel < 1) nel = 1;
+    int *wl = (int *)rt_spm_malloc((size_t)nel * sizeof(int));
+    int *j_b = wl;                       // [nblk_total] owning batch of each job
+    int *j_i = j_b + nblk_total;         // [nblk_total] owning block start i
+    int *j_w = j_i + nblk_total;         // [nblk_total] weight (consumed by the LPT)
+    int *j_own = j_w + nblk_total;       // [nblk_total] assigned part
+    int *wl_off = j_own + nblk_total;    // [batch_size + 1] this worker's list prefix
+    for (int b = 0; b <= args.batch_size; b++) {
+        wl_off[b] = 0;
+    }
+    if (nblk_total > 0) {
+        {
+            int g = 0;
+            for (int b = 0; b < args.batch_size; b++) {
+                const int ql = args.q_seq_lens[b], kl = args.kv_seq_lens[b];
+                int qe = ql;
+                if constexpr (BM == 32) {
+                    qe -= qe % BM;
+                }
+                int cs = kl - ql;
+                if (cs < 0) cs = 0;
+                for (int i = 0; i < qe; i += BM, g++) {
+                    const int cb = MIN(BM, ql - i);
+                    int e = cs + i + cb;
+                    if (e > kl) e = kl;
+                    j_b[g] = b;
+                    j_i[g] = i;
+                    j_w[g] = ((e + BN - 1) / BN) * cb;
+                }
+            }
+            long load[4] = {0, 0, 0, 0};     // parts <= 2 today; keep the loop general
+            for (int k = 0; k < nblk_total; k++) {
+                int best = -1;
+                for (int j = 0; j < nblk_total; j++) {
+                    if (j_w[j] >= 0 && (best < 0 || j_w[j] > j_w[best])) best = j;
+                }
+                int p = 0;
+                for (int q = 1; q < parts; q++) {
+                    if (load[q] < load[p]) p = q;
+                }
+                load[p] += j_w[best];
+                j_own[best] = p;
+                j_w[best] = -1;
+            }
+            // Compact this worker's blocks, batch-major.  Write index never passes the read
+            // index (the enumeration above is already batch-major), so in-place is safe.
+            int nn = 0;
+            for (int b = 0; b < args.batch_size; b++) {
+                wl_off[b] = nn;
+                for (int j = 0; j < nblk_total; j++) {
+                    if (j_own[j] == part && j_b[j] == b) {
+                        j_b[nn] = j_b[j];
+                        j_i[nn] = j_i[j];
+                        nn++;
+                    }
+                }
+            }
+            wl_off[args.batch_size] = nn;
+        }
+    }
     int cur_q_index = 0;
     for (int b = 0; b < args.batch_size; b++) {
         int q_seq_len = args.q_seq_lens[b], k_seq_len = args.kv_seq_lens[b];
@@ -319,7 +408,12 @@ __device__ __always_inline void flash_attention_half(FlashAttentionArgs args) {
         }
         memcpy(ldm_block_table, args.block_table + b * args.block_table_dim,
                args.block_table_dim * sizeof(int));
-        for (int i = part * BM; i < q_full_end; i += parts * BM) {
+        // c38 cand-1: walk this worker's blocks from the entry-time list instead of the
+        // per-batch stride part*BM, part*BM + parts*BM, ... .  q_full_end is enforced when
+        // the list is built (the BM == 32 tail rows stay with the tail phase below).
+        (void)q_full_end;
+        for (int wi = wl_off[b]; wi < wl_off[b + 1]; wi++) {
+            const int i = j_i[wi];
             int cur_BM_q = MIN(BM, q_seq_len - i);
 
             // init online softmax state for this Q block
