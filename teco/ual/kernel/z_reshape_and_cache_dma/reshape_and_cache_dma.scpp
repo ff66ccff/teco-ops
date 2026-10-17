@@ -80,36 +80,61 @@ __global__ void teco_slave_reshape_and_cache_fp16_dma(ReshapeAndCacheArgs args) 
     const int row_bytes  = H * head_bytes;
     const size_t put_gap = (size_t)(head_stride - head_bytes);
 
-    char *spm_key   = (char *)rt_spm_malloc((size_t)row_bytes);
-    char *spm_value = (char *)rt_spm_malloc((size_t)row_bytes);
+    // [c36-RACPIPE] Per token this kernel moves 8 KB through four DMA transactions
+    // (get key, get value, put key, put value).  The measured cost is ~1.6 us per token
+    // per core - four latency exposures, far above what 8 KB of bandwidth would need -
+    // so the lever is to overlap, not to shave instructions.  Two SPM staging sets: the
+    // loads of token t+32 are issued before token t's puts are awaited, and the puts of
+    // token t are awaited before the staging set they used is refilled two iterations
+    // later.  Bytes, destinations and per-token order are unchanged.
+    char *spm_key   = (char *)rt_spm_malloc(2 * (size_t)row_bytes);
+    char *spm_value = (char *)rt_spm_malloc(2 * (size_t)row_bytes);
+    char *spmk[2] = {spm_key, spm_key + row_bytes};
+    char *spmv[2] = {spm_value, spm_value + row_bytes};
 
-    for (int t = tid; t < T; t += CORE_NUM) {
+    MemcpyHandle get_key[2], get_value[2], put_key[2], put_value[2];
+    const bool has_first = (tid < T);
+    if (has_first) {
+        const half *src_key0   = key   + (size_t)tid * key_stride / sizeof(half);
+        const half *src_value0 = value + (size_t)tid * value_stride / sizeof(half);
+        memcpy_async(spmk[0], src_key0, row_bytes, MemcpyGlobalToSpm, get_key[0]);
+        memcpy_async(spmv[0], src_value0, row_bytes, MemcpyGlobalToSpm, get_value[0]);
+    }
+
+    int it = 0;
+    for (int t = tid; t < T; t += CORE_NUM, ++it) {
+        const int p = it & 1;
+        const int tn = t + CORE_NUM;
+
+        // issue the next token's loads into the other staging set: they overlap this
+        // token's puts and are awaited one iteration later.
+        if (tn < T) {
+            const half *src_key_n   = key   + (size_t)tn * key_stride / sizeof(half);
+            const half *src_value_n = value + (size_t)tn * value_stride / sizeof(half);
+            memcpy_async(spmk[p ^ 1], src_key_n, row_bytes, MemcpyGlobalToSpm, get_key[p ^ 1]);
+            memcpy_async(spmv[p ^ 1], src_value_n, row_bytes, MemcpyGlobalToSpm, get_value[p ^ 1]);
+        }
+
+        memcpy_wait(get_key[p]);
+        memcpy_wait(get_value[p]);
+
         int64_t slot = slot_mapping[t];
-        if (slot < 0) continue;
+        if (slot >= 0) {
+            int block_id  = slot / block_size;
+            int block_off = slot % block_size;
 
-        int block_id  = slot / block_size;
-        int block_off = slot % block_size;
+            char *cache_key_base = (char *)key_cache
+                + block_id * block_stride + block_off * entry_stride;
+            char *cache_value_base = (char *)value_cache
+                + block_id * block_stride + block_off * entry_stride;
 
-        const half *src_key   = key   + t * key_stride / sizeof(half);
-        const half *src_value = value + t * value_stride / sizeof(half);
-
-        char *cache_key_base = (char *)key_cache
-            + block_id * block_stride + block_off * entry_stride;
-        char *cache_value_base = (char *)value_cache
-            + block_id * block_stride + block_off * entry_stride;
-
-        MemcpyHandle get_key, get_value, put_key, put_value;
-        memcpy_async(spm_key,   src_key,   row_bytes, MemcpyGlobalToSpm, get_key);
-        memcpy_async(spm_value, src_value, row_bytes, MemcpyGlobalToSpm, get_value);
-        memcpy_wait(get_key);
-        memcpy_wait(get_value);
-
-        memcpy_async(cache_key_base, spm_key, row_bytes, head_bytes,
-                     {put_gap, 0}, MemcpySpmToGlobal, put_key);
-        memcpy_async(cache_value_base, spm_value, row_bytes, head_bytes,
-                     {put_gap, 0}, MemcpySpmToGlobal, put_value);
-        memcpy_wait(put_key);
-        memcpy_wait(put_value);
+            memcpy_async(cache_key_base, spmk[p], row_bytes, head_bytes,
+                         {put_gap, 0}, MemcpySpmToGlobal, put_key[p]);
+            memcpy_async(cache_value_base, spmv[p], row_bytes, head_bytes,
+                         {put_gap, 0}, MemcpySpmToGlobal, put_value[p]);
+            memcpy_wait(put_key[p]);
+            memcpy_wait(put_value[p]);
+        }
     }
 
     rt_spm_free(spm_key);
