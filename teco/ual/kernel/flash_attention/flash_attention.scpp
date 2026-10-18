@@ -124,7 +124,22 @@ __device__ void online_softmax_step(
         float m_new = MAX(pre_max[i], m_block);
         // m_new = MAX(m_new, 0.0f);
         cur_max[i] = m_new;
-        scale[i] = expf(pre_max[i] - m_new);
+    }
+    // Step 1b: scale = exp(m_old - m_new), 16 rows per SIMD op.  vexp() is the vendor
+    // 16-lane exp and the 16-lane subtract rounds exactly like the scalar one, so the
+    // rescale factor keeps the same fp32 value; only the transcendental leaves the
+    // scalar pipe.  The tail stays scalar (m is a runtime row count).
+    {
+        int sc_i = 0;
+        for (; sc_i <= m - 16; sc_i += 16) {
+            floatv16 vpm, vnm;
+            simd_load(vpm, pre_max + sc_i);
+            simd_load(vnm, cur_max + sc_i);
+            simd_store(vexp(simd_vfsubs(vpm, vnm)), scale + sc_i);
+        }
+        for (; sc_i < m; sc_i++) {
+            scale[sc_i] = expf(pre_max[sc_i] - cur_max[sc_i]);
+        }
     }
 
     // Step 2: inplace scores: S -> exp(S - m_new), cal l_new

@@ -202,10 +202,16 @@ static __device__ __always_inline void online_softmax_panel_T(
         simd_store(pm1, pbuf + 16);
         simd_store(nm0, mbuf);
         simd_store(nm1, mbuf + 16);
-        for (int u = 0; u < 32; u++) {
-            int r = r0 + u;
-            if (r >= cur_M) break;
-            scale[r] = expf(pbuf[u] - mbuf[u]);
+        const int u_end = MIN(cur_M - r0, 32);
+        int u = 0;
+        for (; u + 16 <= u_end; u += 16) {
+            floatv16 vp, vm;
+            simd_load(vp, pbuf + u);
+            simd_load(vm, mbuf + u);
+            simd_store(vexp(simd_vfsubs(vp, vm)), scale + r0 + u);
+        }
+        for (; u < u_end; u++) {
+            scale[r0 + u] = expf(pbuf[u] - mbuf[u]);
         }
     }
 
