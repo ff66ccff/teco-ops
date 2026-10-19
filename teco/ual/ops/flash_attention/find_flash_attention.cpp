@@ -63,8 +63,22 @@ int findFlashAttentionBranch(const FlashAttentionPatchArgs *args) {
     // static_assert; it is bound once here, at operator dispatch, and -1 makes
     // findImpl() return Status::NOT_IMPLEMENTED (the existing fail-closed
     // convention) instead of silently returning wrong numbers.
-    if (head_dim % 16 != 0) {
-        ERROR("flash_attention ALGO0 needs size_per_head %% 16 == 0, got %d\n", head_dim);
+    // ALGO0's Value-side panel loop strides the head dimension by gemm_bn == 32
+    // (`for (int hb = 0; hb < BK / gemm_bn; hb++)`, BK = size_per_head), so a head dimension
+    // that is not a multiple of 32 silently drops the trailing BK % 32 columns of V; and BN is
+    // hardcoded to 32 while the paged block index is derived as `cur_block = j / block_size`, so
+    // any block_size other than 32 is already outside this instantiation's contract.  Both
+    // preconditions are bound once here, at operator dispatch: -1 makes findImpl() return
+    // Status::NOT_IMPLEMENTED, the existing fail-closed convention, instead of returning silently
+    // wrong numbers (the same defect class as the D512 block_size guard below).  #47 carries the
+    // same pair of guards, so a merge of the two keeps one copy of each.
+    if (head_dim % 32 != 0) {
+        ERROR("flash_attention ALGO0 needs size_per_head %% 32 == 0, got %d\n", head_dim);
+        return -1;
+    }
+    if (args->rvargs->block_size != 32) {
+        ERROR("flash_attention ALGO0 (head_dim=%d) needs block_size == 32, got %d\n",
+              head_dim, args->rvargs->block_size);
         return -1;
     }
 

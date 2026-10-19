@@ -303,7 +303,7 @@ packing、DMA、SPM 分配和 ABI 保持原实现。BM64 保留标量路径，
 算术、加法顺序、`softmax_scale`、causal mask、`l_block` 求和顺序、DMA、
 SPM 分配或 ABI；BM64/D256 仍走标量路径。CPU 端按位等价模型（scalar vs
 16-wide，含负向对照）与设备端 baseline/candidate `uint16` 逐位比对各自独立
-验证，详见 `flash_attention_bm128_simd_20261010.md`。
+验证，详见下方「附录：D256/D512 分块与 `cur_BM` 收敛的测量口径」。
 **仅算子级收益，不主张端到端或模型级增益。**
 
 Gemma 独立测试使用 FP16 Q[N,8,512]、KV[blocks,1,32,512]、scale=1、
@@ -326,3 +326,26 @@ kernel 差异分别留证。复现入口和固定官方 main 基线见
 [官方定向 CI](https://github.com/Tecorigin/teco-ops/pull/41#issuecomment-6041987041)
 通过的 head 是 `cb7e7732b81b01eb5c5330459d3ab5c130185ceb`；后续文档
 提交保留该 kernel。完整组合 wheel、官方模型环境与组委会完整精度仍需验证。
+
+## 附录：D256/D512 分块与 `cur_BM` 收敛的测量口径
+
+本小节合并原 `curbm-loops-note.md`、`curbm-matmul-m-note.md`、
+`flash_attention_bm128_simd_20261010.md` 三份过程笔记（全文仍保留在本 PR 的提交历史中）；
+其中引用的构建哈希、`sha256` 与逐例原值随原笔记归档，不在本小节重复。
+
+固定口径：官方固定命令形态
+`./build/demo --gid=0 --perf_repeat=50 --warm_repeat=3 --gtest_repeat=1 --case_path=zoo/teco/flash_attention/test_case/<c>.prototxt`；
+性能一律「同一构建根、只替换 `libteco_ops.so`、3 次取中位」；正确性逐例对照 `max_error`。
+
+| 改动 | 机制 | 位等价性依据 | 记录 |
+| --- | --- | --- | --- |
+| D512/BM32 后处理两趟循环（`softmax_scale` 乘与 Step C `float→half`）由 `BM*BN` 收敛到 `cur_BM*BN`，`if constexpr (BM == 32)` 编译期折叠 | decode 时 `cur_BM = 1`，其余 31 个行组无消费者 | 被跳过缩放/转换的行只被本身即被丢弃的 `P @ V` 输出行消费 ⇒ 逐位不变 | 私有加速卡窗 `c195874`：N1/KV33 −1.81%、N1/KV4352 −0.67%、N4 −0.70%、N8 −0.60%（80 例 focused 全部 bitwise equal） |
+| D512/BM32 的 `QK^T` 与 `P @ V` matmul M 收敛到 `cur_BM` | 同上（行级冗余） | 丢弃行不参与输出 | 同上 |
+| ALGO0/BM128 的 Step B（`o_accum` rescale）与 Step E（`o_accum` 累加）改用既有 16 宽 `floatv16` 体 | 两条循环都是逐元素 fp32 运算、无重结合，仅改变每指令搬运元素数 | 21/21 CPU 检查、13 组全几何端到端 `diff_words32 = 0`、12/12 设备 `oData` dumps `bitdiff = 0`（11,993,600 halfword） | 2026-10-10 同构建 A/B（`--perf_repeat=1`，不构成计时证据） |
+
+边界与未执行项：ALGO0/BM128 的 SIMD 化隐含 `BK % 16 == 0`，它与基线
+`for (hb = 0; hb < BK / gemm_bn; hb++)` 已要求的 `BK % 32 == 0` 相容；该前置条件在
+`findFlashAttentionBranch()` 一次性 fail-closed 绑定（hot path 无分支、无 `getenv`）。
+基线 `BK / gemm_bn` 截断导致 `head_dim % 32` 尾列被静默丢弃的缺陷不在本 PR 范围，
+但已被同处的 `% 32` 守卫在入口拒绝，不再静默丢列。私有窗的 focused/prefill/模型门禁
+在本分支上未重跑，`cur_BM` 两项的位等价与计时数字为引用值，不是本分支复现值。
