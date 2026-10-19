@@ -209,6 +209,55 @@ void causal_conv1d_fn_torch(
     out.copy_(out_t.t());
 }
 
+// ---------------------------------------------------------------------------
+// [c41/rms task-6 L2 candidate] C++ TORCH_LIBRARY out= entry for the rms_norm decode
+// hot path.
+//
+// Measured (op level, real Gemma-4-12B-it decode shapes, 337 stations/step, host-side
+// enqueue time, 7 reps median; /root/tmpwork/c41/rms/evidence/a2-probe-*.json,
+// a3-probe-*.json):
+//   Python torch.library.custom_op("gemma4_rms_norm::whole")  77.99 us/call
+//   C++ TORCH_LIBRARY op (no-op C++ kernel)                    6.16 us/call
+//   raw pybind tecoops.rms_norm                               19.58 us/call
+//   torch.empty (pure dispatch, no device work)               19.12 us/call
+//   => the Python-registered-op path costs +58.5 us/call; 337 calls/step = 26.3 ms/step.
+//
+// This op is the same task the delivered `rms_norm` pybind entry launches: identical
+// kernel, identical arguments, identical current stream, same deferred `out` buffer.
+// No numerical change.
+void rms_norm_out_torch(torch::Tensor input, torch::Tensor weight, torch::Tensor output,
+                        double eps) {
+    tecoopsHandle_t handle = getGlobalHandle();
+    tecoopsSetStream(handle, torch::sdaa::getCurrentSDAAStream());
+    tecoopsRmsNorm(handle,
+                   input.data_ptr(), weight.data_ptr(),
+                   nullptr, output.data_ptr(), nullptr,
+                   static_cast<int>(input.size(0)), static_cast<int>(input.size(1)),
+                   static_cast<float>(eps));
+}
+
+// Meta kernel: `out=` op returns nothing and only mutates `output`, so the fake impl
+// needs to do nothing but exist (torch.compile / Inductor requires it).
+void rms_norm_out_meta(torch::Tensor input, torch::Tensor weight, torch::Tensor output,
+                       double eps) {
+    (void)input;
+    (void)weight;
+    (void)output;
+    (void)eps;
+}
+
+TORCH_LIBRARY(tecoops_ops, m) {
+    m.def("rms_norm_out(Tensor input, Tensor weight, Tensor(a!) output, float eps) -> ()");
+}
+
+TORCH_LIBRARY_IMPL(tecoops_ops, PrivateUse1, m) {
+    m.impl("rms_norm_out", &rms_norm_out_torch);
+}
+
+TORCH_LIBRARY_IMPL(tecoops_ops, Meta, m) {
+    m.impl("rms_norm_out", &rms_norm_out_meta);
+}
+
 PYBIND11_MODULE(_torch_ext, m) {
     m.def("flatten_rays", &flatten_rays_torch, "flatten_rays (SDAA)");
     m.def("morton3D_invert", &morton3D_invert_torch, "morton3D_invert (SDAA)");
