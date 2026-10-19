@@ -62,6 +62,17 @@ static __device__ __always_inline void load_kv_cache(
     memcpy(dst, src, num_tokens * head_size * sizeof(half));
 }
 
+static __device__ __always_inline void load_kv_cache_async(
+    half *dst, const half *cache, const int *block_table, int logical_block,
+    int kv_head_idx , int kv_head_num, int block_size, int head_size, int num_tokens,
+    MemcpyHandle &h) {
+    int block_id = block_table[logical_block];
+    const half *src = cache
+        + block_id * kv_head_num * block_size * head_size
+        + kv_head_idx  * block_size * head_size;
+    memcpy_async(dst, src, num_tokens * head_size * sizeof(half), MemcpyGlobalToSpm, h);
+}
+
 static __device__ __always_inline void fill_inf(float *buf, int len) {
     // if use simd should assert aligned
     int neg_inf_bit = 0xFF800000;
@@ -194,24 +205,30 @@ static __device__ __always_inline void online_softmax_panel_T(
     simd_store(nm0, cur_max + r0);
     simd_store(nm1, cur_max + r0 + 16);
 
-    // rescale factors: scalar expf on the same (pre_max, m_new) pair the
-    // untransposed path feeds it, so scale[] is bit-identical as well
+    // rescale factors: vector exp without stack spill when full panel
     {
-        float pbuf[32], mbuf[32];
-        simd_store(pm0, pbuf);
-        simd_store(pm1, pbuf + 16);
-        simd_store(nm0, mbuf);
-        simd_store(nm1, mbuf + 16);
         const int u_end = MIN(cur_M - r0, 32);
-        int u = 0;
-        for (; u + 16 <= u_end; u += 16) {
-            floatv16 vp, vm;
-            simd_load(vp, pbuf + u);
-            simd_load(vm, mbuf + u);
-            simd_store(vexp(simd_vfsubs(vp, vm)), scale + r0 + u);
-        }
-        for (; u < u_end; u++) {
-            scale[r0 + u] = expf(pbuf[u] - mbuf[u]);
+        if (u_end == 32) {
+            floatv16 diff0 = simd_vfsubs(pm0, nm0);
+            floatv16 diff1 = simd_vfsubs(pm1, nm1);
+            simd_store(vexp(diff0), scale + r0);
+            simd_store(vexp(diff1), scale + r0 + 16);
+        } else {
+            float pbuf[32], mbuf[32];
+            simd_store(pm0, pbuf);
+            simd_store(pm1, pbuf + 16);
+            simd_store(nm0, mbuf);
+            simd_store(nm1, mbuf + 16);
+            int u = 0;
+            for (; u + 16 <= u_end; u += 16) {
+                floatv16 vp, vm;
+                simd_load(vp, pbuf + u);
+                simd_load(vm, mbuf + u);
+                simd_store(vexp(simd_vfsubs(vp, vm)), scale + r0 + u);
+            }
+            for (; u < u_end; u++) {
+                scale[r0 + u] = expf(pbuf[u] - mbuf[u]);
+            }
         }
     }
 
@@ -247,13 +264,22 @@ static __device__ __always_inline void online_softmax_panel_T(
             p_score[(r0 + 16 + u) * BN + t] = hhi[u];
         }
     }
-    float sbuf[32];
-    simd_store(vsum0, sbuf);
-    simd_store(vsum1, sbuf + 16);
-    for (int u = 0; u < 32; u++) {
-        int r = r0 + u;
-        if (r >= cur_M) break;
-        cur_sum[r] = pre_sum[r] * scale[r] + sbuf[u];
+    const int u_sum_end = MIN(cur_M - r0, 32);
+    if (u_sum_end == 32) {
+        floatv16 ps0, ps1, sc0, sc1;
+        simd_load(ps0, pre_sum + r0);
+        simd_load(ps1, pre_sum + r0 + 16);
+        simd_load(sc0, scale + r0);
+        simd_load(sc1, scale + r0 + 16);
+        simd_store(ps0 * sc0 + vsum0, cur_sum + r0);
+        simd_store(ps1 * sc1 + vsum1, cur_sum + r0 + 16);
+    } else {
+        float sbuf[32];
+        simd_store(vsum0, sbuf);
+        simd_store(vsum1, sbuf + 16);
+        for (int u = 0; u < u_sum_end; u++) {
+            cur_sum[r0 + u] = pre_sum[r0 + u] * scale[r0 + u] + sbuf[u];
+        }
     }
 }
 
@@ -291,7 +317,9 @@ __device__ __always_inline void flash_attention_half(FlashAttentionArgs args) {
     int token_size = args.size_per_head * sizeof(half);
     int * ldm_block_table = (int*)rt_spm_malloc(args.block_table_dim * sizeof(int));
     half * qbuf = (half*)rt_spm_malloc(BM * token_size);            // BM * BK
-    half * ktmp = (half*)rt_spm_malloc(BN * token_size);            // BN * BK
+    half * ktmp0 = (half*)rt_spm_malloc(BN * token_size);           // BN * BK
+    half * ktmp1 = (half*)rt_spm_malloc(BN * token_size);           // BN * BK
+    half * ktmp = ktmp0;
     // kbuf carries the transposed query block Q^T [BK, BM] on every NT-form path
     // (BM == 32/64/128, see below).  qbuf is dead once Q^T has been built and is reused
     // as the per-panel S^T scratch on BM == 128 (see the score pipeline below).
@@ -488,15 +516,31 @@ __device__ __always_inline void flash_attention_half(FlashAttentionArgs args) {
             if (causal_q_start < 0) causal_q_start = 0;
             int kv_tile_end = causal_q_start + i + cur_BM;
             if (kv_tile_end > k_seq_len) kv_tile_end = k_seq_len;
-            for (int j = 0; j < kv_tile_end; j += BN) {
+            MemcpyHandle kh[2];
+            int tile_step = 0;
+            int kv_head_idx = head / num_kv_groups;
+            if (0 < kv_tile_end) {
+                int cur_BN0 = MIN(BN, k_seq_len - 0);
+                int cur_block0 = 0 / args.block_size;
+                load_kv_cache_async(ktmp0, (const half *)args.key_cache, ldm_block_table, cur_block0,
+                                    kv_head_idx, args.local_kv_head_num, args.block_size,
+                                    args.size_per_head, cur_BN0, kh[0]);
+            }
+            for (int j = 0; j < kv_tile_end; j += BN, tile_step++) {
                 int cur_BN = MIN(BN, k_seq_len - j);
+                int cur_block = j / args.block_size;
+                half *ktmp_cur = ((tile_step & 1) == 0) ? ktmp0 : ktmp1;
+                half *ktmp_nxt = ((tile_step & 1) == 0) ? ktmp1 : ktmp0;
+                memcpy_wait(kh[tile_step & 1]);
 
-                // load k [cur_BN, size_per_head] -> ktmp
-                int kv_head_idx = head / num_kv_groups;                 // GQA
-                int cur_block = j / args.block_size;                    // BN == block_size
-                load_kv_cache(ktmp, (const half *)args.key_cache, ldm_block_table, cur_block,
-                              kv_head_idx , args.local_kv_head_num, args.block_size,
-                              args.size_per_head, cur_BN);
+                int j_next = j + BN;
+                if (j_next < kv_tile_end) {
+                    int cur_BN_nxt = MIN(BN, k_seq_len - j_next);
+                    int cur_block_nxt = j_next / args.block_size;
+                    load_kv_cache_async(ktmp_nxt, (const half *)args.key_cache, ldm_block_table, cur_block_nxt,
+                                        kv_head_idx, args.local_kv_head_num, args.block_size,
+                                        args.size_per_head, cur_BN_nxt, kh[(tile_step + 1) & 1]);
+                }
 
                 // ---------------------------------------------------------------
                 // BM == 128 (the D128 instantiations - 8 of the 11 official cases, and
@@ -525,7 +569,7 @@ __device__ __always_inline void flash_attention_half(FlashAttentionArgs args) {
                 if constexpr (BM == 128) {
                     float *cst = (float *)qbuf;          // [128, 32] float panel scratch
                     const int npb = (cur_BM + 31) >> 5;  // live 32-query panels
-                    auto tA = make_tensor<2>((half *)ktmp,
+                    auto tA = make_tensor<2>((half *)ktmp_cur,
                         {static_cast<size_t>(cur_BN), static_cast<size_t>(BK)});
                     MatmulConfig matmul_cfg;
                     Matmul matmul(matmul_cfg);
@@ -557,7 +601,7 @@ __device__ __always_inline void flash_attention_half(FlashAttentionArgs args) {
                         // which is exactly the element set apply_causal_mask() builds on
                         // S[cur_BM, BN].
                         const int off = ({ int qs = k_seq_len - q_seq_len; qs < 0 ? 0 : qs; }) + i - j;
-                        {
+                        if (off < cur_BN) {
                             int lim = cur_BN - off - 2;
                             for (int t = 0; t < cur_BN; t++) {
                                 int rmax = t - off - 1;
@@ -603,7 +647,7 @@ __device__ __always_inline void flash_attention_half(FlashAttentionArgs args) {
                         // layout (second panel at element offset K*32) and ignores B strides, so
                         // a plain row-major [BK, 64] view would be read wrongly.
                         float *st = (float *)obuf;
-                        auto tA = make_tensor<2>((half *)ktmp,
+                        auto tA = make_tensor<2>((half *)ktmp_cur,
                             {static_cast<size_t>(cur_BN), static_cast<size_t>(BK)});
                         const int npb = (cur_BM + 31) >> 5;   // live 32-column panels: 1 or 2
                         for (int pb = 0; pb < npb; pb++) {
@@ -675,34 +719,7 @@ __device__ __always_inline void flash_attention_half(FlashAttentionArgs args) {
                                     cur_BM, cur_BN, BN);
                 }
 
-                // Step B: o_accum: O *= exp(m_old - m_new)
-                // [c39 P5 MCP-c39-1] On the FIRST KV tile of a Q block this pass is a
-                // provable no-op: o_accum was zeroed for this block just above (BM*BK
-                // f32 stores) and scale[ri] = expf(m_prev - m_new) with m_prev = -inf
-                // (fill_inf) and m_new finite for every live row - KV index j = 0 is
-                // causally allowed for row r because (k_seq_len - q_seq_len) + i + r + 1 >= 1 -
-                // so scale == expf(-inf) == 0 and the pass stores 0 over 0.  The bound is a
-                // per-tile TRIP COUNT (a select, not a branch); the loop body, the element
-                // arithmetic and every live row's rounding are untouched.
-                const int rescale_end = (j == 0) ? 0 : cur_BM;
-                for (int ri = 0; ri < rescale_end; ri++) {
-                    float s = scale[ri];
-                    if constexpr (BM == 32 || BM == 64 || BM == 128) {
-                        floatv16 vscale = s;
-                        float *row = o_accum + ri * BK;
-                        for (int rk = 0; rk < BK; rk += 16) {
-                            floatv16 value;
-                            simd_load(value, row + rk);
-                            value = value * vscale;
-                            simd_store(value, row + rk);
-                        }
-                    } else {
-                        for (int rk = 0; rk < BK; rk++) {
-                            o_accum[ri * BK + rk] *= s;
-                        }
-                    }
-                }
-
+                // Step B: fused into Step E (o_accum scaled in registers alongside outO addition)
                 if constexpr (BM != 128) {
                 // Step C: float->half: outc -> p_score (独立buffer, 非ktmp, 避免head_size=64越界)
                 {
@@ -741,9 +758,7 @@ __device__ __always_inline void flash_attention_half(FlashAttentionArgs args) {
 
                 half * vbuf = kbuf;
                 if constexpr (BM == 32 || BM == 64 || BM == 128) {
-                    // The NT GEMM above already consumed the K tile, so the PV staging can reuse
-                    // ktmp and leave kbuf (which holds Q^T) intact across KV tiles.
-                    vbuf = ktmp;
+                    vbuf = ktmp_cur;
                 }
                 float * outO = outc;            // reuse outc
                 int gemm_bn = 32;
@@ -800,21 +815,32 @@ __device__ __always_inline void flash_attention_half(FlashAttentionArgs args) {
                     matmul.storeC_spm_async(tO);
                     matmul.wait_storeC(1);
 
-                    // Step E: o_accum[i][hb*32 + k] += outO[i][k]
+                    // Step E: fused o_accum update with online rescale
                     for (int ai = 0; ai < cur_BM; ai++) {
                         if constexpr (BM == 32 || BM == 64 || BM == 128) {
                             float *dst = o_accum + ai * BK + hb * gemm_bn;
                             float *src = outO + ai * gemm_bn;
+                            floatv16 vscale = scale[ai];
                             for (int ak = 0; ak < 32; ak += 16) {
-                                floatv16 previous, contribution;
-                                simd_load(previous, dst + ak);
+                                floatv16 contribution;
                                 simd_load(contribution, src + ak);
-                                previous = previous + contribution;
-                                simd_store(previous, dst + ak);
+                                if (j == 0) {
+                                    simd_store(contribution, dst + ak);
+                                } else {
+                                    floatv16 previous;
+                                    simd_load(previous, dst + ak);
+                                    previous = previous * vscale;
+                                    previous = previous + contribution;
+                                    simd_store(previous, dst + ak);
+                                }
                             }
                         } else {
                             for (int ak = 0; ak < gemm_bn; ak++) {
-                                o_accum[ai * BK + hb * gemm_bn + ak] += outO[ai * gemm_bn + ak];
+                                if (j == 0) {
+                                    o_accum[ai * BK + hb * gemm_bn + ak] = outO[ai * gemm_bn + ak];
+                                } else {
+                                    o_accum[ai * BK + hb * gemm_bn + ak] = o_accum[ai * BK + hb * gemm_bn + ak] * scale[ai] + outO[ai * gemm_bn + ak];
+                                }
                             }
                         }
                     }
