@@ -168,7 +168,7 @@ void flash_attn_varlen_func_torch(
     make_desc(vCacheDesc, TECOOPS_DATA_HALF, v);
     make_desc(oDataDesc, TECOOPS_DATA_HALF, out);
 
-    tecoopsFlashAttentionWithScale(handle,
+    const tecoopsStatus_t status = tecoopsFlashAttentionWithScale(handle,
                           max_seqlen_q, max_seqlen_k, max_block_num, scale,
                           (const int*)q_lens.data_ptr(), (const int *)seqused_k.data_ptr(),
                           blockTableDesc, block_table.data_ptr(),
@@ -183,6 +183,14 @@ void flash_attn_varlen_func_torch(
     tecoopsDestroyTensorDescriptor(kCacheDesc);
     tecoopsDestroyTensorDescriptor(vCacheDesc);
     tecoopsDestroyTensorDescriptor(oDataDesc);
+
+    // Do not swallow the C ABI status: an unsupported head_dim / block_size (or any
+    // other failure) used to return an unwritten output tensor that "looked fine".
+    // The descriptors are released above, so the Python exception leaks nothing.
+    TORCH_CHECK(status == TECOOPS_STATUS_SUCCESS,
+                "flash_attention rejected the call (status=", static_cast<int>(status),
+                "); unsupported head_dim/block_size or a failed dispatch. The output "
+                "tensor was not written.");
 }
 
 void causal_conv1d_fn_torch(
