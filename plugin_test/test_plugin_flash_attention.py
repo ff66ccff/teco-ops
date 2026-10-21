@@ -31,13 +31,12 @@ import tecoinference
 from tvm.contrib.teco_infer_dyn import dyn
 from onnx import helper, TensorProto
 import tvm
-from tvm import relay
 
-# Register op once at module level
+# The low-level plugin consumes per-sequence query lengths, as the C API does.
 try:
     plugins.register_op(
         op_name="plugin_flash_attention",
-        inputs=["q", "k_cache", "v_cache", "block_table", "cu_seqlens_q", "seqused_k"],
+        inputs=["q", "k_cache", "v_cache", "block_table", "q_seq_lens", "seqused_k"],
         attrs={"max_seqlen_q": "int", "max_seqlen_k": "int", "max_block_num": "int"}
     )
 except AssertionError:
@@ -45,21 +44,15 @@ except AssertionError:
 
 
 def create_plugin_onnx_model(input_shapes, attributes):
-    """Build ONNX model with plugin_flash_attention node."""
-    input_names = list(input_shapes.keys())
+    """Build a plugin node whose q_seq_lens input contains actual lengths."""
     inputs = []
     for name, shape in input_shapes.items():
-        dtype = TensorProto.INT32 if name in ("block_table", "cu_seqlens_q", "seqused_k") else TensorProto.FLOAT16
+        dtype = TensorProto.INT32 if name in ("block_table", "q_seq_lens", "seqused_k") else TensorProto.FLOAT16
         inputs.append(helper.make_tensor_value_info(name, dtype, shape))
     output = helper.make_tensor_value_info("output", TensorProto.FLOAT16, input_shapes["q"])
-
     node = helper.make_node(
-        "plugin_flash_attention",
-        input_names,
-        ["output"],
-        **attributes,
-        domain="my_custom_ops",
-        version=1
+        "plugin_flash_attention", list(input_shapes), ["output"],
+        **attributes, domain="my_custom_ops", version=1
     )
     graph = helper.make_graph([node], "plugin_flash_attention", inputs, [output])
     model = helper.make_model(graph)
@@ -67,130 +60,100 @@ def create_plugin_onnx_model(input_shapes, attributes):
     return model
 
 
-def test_prefill():
-    """prefill: L=S=64"""
-    print("  prefill (L=S=64)...", end=" ")
-    B, H, KV, HS, BS = 1, 8, 4, 64, 32
-    L = S = 64
-    blk = (S + BS - 1) // BS
-    np.random.seed(42)
+def _make_inputs(q_lens, kv_lens, seed):
+    """Pack independent dense sequences into shuffled physical 32-token pages."""
+    rng = np.random.default_rng(seed)
+    heads, kv_heads, head_size, block_size = 8, 4, 64, 32
+    counts = [(length + block_size - 1) // block_size for length in kv_lens]
+    num_blocks = sum(counts)
+    q = rng.standard_normal((sum(q_lens), heads, head_size)).astype(np.float16)
+    kc = np.zeros((num_blocks, kv_heads, block_size, head_size), dtype=np.float16)
+    vc = np.zeros_like(kc)
+    bt = np.zeros((len(q_lens), max(counts)), dtype=np.int32)
+    pages = rng.permutation(num_blocks)
+    dense_k, dense_v = [], []
+    cursor = 0
+    for batch, length in enumerate(kv_lens):
+        key = rng.standard_normal((length, kv_heads, head_size)).astype(np.float16)
+        value = rng.standard_normal((length, kv_heads, head_size)).astype(np.float16)
+        dense_k.append(key)
+        dense_v.append(value)
+        for logical in range(counts[batch]):
+            physical = pages[cursor]
+            cursor += 1
+            bt[batch, logical] = physical
+            start = logical * block_size
+            count = min(block_size, length - start)
+            kc[physical, :, :count, :] = key[start:start + count].transpose(1, 0, 2)
+            vc[physical, :, :count, :] = value[start:start + count].transpose(1, 0, 2)
+    arrays = [q, kc, vc, bt, np.array(q_lens, dtype=np.int32), np.array(kv_lens, dtype=np.int32)]
+    return arrays, dense_k, dense_v
 
-    q = np.random.randn(L, H, HS).astype(np.float16)
-    kc = np.random.randn(blk, KV, BS, HS).astype(np.float16)
-    vc = np.random.randn(blk, KV, BS, HS).astype(np.float16)
-    bt = np.zeros((1, blk), dtype=np.int32)
-    cu = np.array([0, L], dtype=np.int32)
-    sq = np.array([S], dtype=np.int32)
 
-    model = create_plugin_onnx_model(
-        {"q": (L, H, HS), "k_cache": (blk, KV, BS, HS), "v_cache": (blk, KV, BS, HS),
-         "block_table": (1, blk), "cu_seqlens_q": (2,), "seqused_k": (1,)},
-        {"max_seqlen_q": L, "max_seqlen_k": S, "max_block_num": blk}
-    )
-    mod, params = tvm.relay.frontend.from_onnx(
-        model, {"q": (L, H, HS), "k_cache": (blk, KV, BS, HS), "v_cache": (blk, KV, BS, HS),
-                "block_table": (1, blk), "cu_seqlens_q": (2,), "seqused_k": (1,)})
+def _reference(q, dense_k, dense_v, q_lens):
+    """Independent float32 CPU causal attention on the original dense sequences."""
+    result = np.empty(q.shape, dtype=np.float32)
+    offset = 0
+    for key, value, length in zip(dense_k, dense_v, q_lens):
+        query = q[offset:offset + length].astype(np.float32).transpose(1, 0, 2)
+        groups = q.shape[1] // key.shape[1]
+        key = np.repeat(key.astype(np.float32), groups, axis=1).transpose(1, 2, 0)
+        value = np.repeat(value.astype(np.float32), groups, axis=1).transpose(1, 0, 2)
+        scores = (query @ key) / math.sqrt(q.shape[2])
+        kv_length = key.shape[2]
+        allowed = np.arange(kv_length)[None, :] <= (kv_length - length + np.arange(length))[:, None]
+        scores = np.where(allowed[None, :, :], scores, -np.inf)
+        probs = np.exp(scores - scores.max(axis=-1, keepdims=True))
+        probs /= probs.sum(axis=-1, keepdims=True)
+        result[offset:offset + length] = (probs @ value).transpose(1, 0, 2)
+        offset += length
+    return result
+
+
+def _run_case(name, q_lens, kv_lens, seed):
+    arrays, dense_k, dense_v = _make_inputs(q_lens, kv_lens, seed)
+    names = ["q", "k_cache", "v_cache", "block_table", "q_seq_lens", "seqused_k"]
+    shapes = {key: value.shape for key, value in zip(names, arrays)}
+    model = create_plugin_onnx_model(shapes, {
+        "max_seqlen_q": max(q_lens), "max_seqlen_k": max(kv_lens),
+        "max_block_num": arrays[1].shape[0],
+    })
+    mod, _ = tvm.relay.frontend.from_onnx(model, shapes)
     fbs_model = dyn.to_teco_infer_dyn(mod, {}, "teco_dyn")
     engine = tecoinference.Engine(fbs_model)
     ctx = engine.create_context()
-
-    ctx.set_input(0, q)
-    ctx.set_input(1, kc)
-    ctx.set_input(2, vc)
-    ctx.set_input(3, bt)
-    ctx.set_input(4, cu)
-    ctx.set_input(5, sq)
+    for index, value in enumerate(arrays):
+        ctx.set_input(index, value)
     ctx.executor_run()
-    out = ctx.get_output(0)
-    assert out.shape == (L, H, HS), f"shape mismatch: {out.shape}"
-    print(f"OK (shape={out.shape})")
+    out = np.asarray(ctx.get_output(0))
+    ref = _reference(arrays[0], dense_k, dense_v, q_lens)
+    assert out.shape == ref.shape, f"{name}: shape mismatch: {out.shape}"
+    assert np.isfinite(out).all(), f"{name}: non-finite output"
+    np.testing.assert_allclose(out.astype(np.float32), ref, atol=2e-3, rtol=1e-2, err_msg=name)
+    max_error = np.max(np.abs(out.astype(np.float32) - ref))
+    print(f"  {name}: shape={out.shape}, max_error={max_error:.6e} PASSED")
+
+
+def test_prefill():
+    _run_case("prefill", [64], [64], 42)
 
 
 def test_decode():
-    """decode: L=1, S=128"""
-    print("  decode (L=1, S=128)...", end=" ")
-    H, KV, HS, BS = 8, 4, 64, 128
-    L, S = 1, 128
-    blk = (S + BS - 1) // BS
-    np.random.seed(43)
-
-    q = np.random.randn(L, H, HS).astype(np.float16)
-    kc = np.random.randn(blk, KV, BS, HS).astype(np.float16)
-    vc = np.random.randn(blk, KV, BS, HS).astype(np.float16)
-    bt = np.zeros((1, blk), dtype=np.int32)
-    cu = np.array([0, L], dtype=np.int32)
-    sq = np.array([S], dtype=np.int32)
-
-    model = create_plugin_onnx_model(
-        {"q": (L, H, HS), "k_cache": (blk, KV, BS, HS), "v_cache": (blk, KV, BS, HS),
-         "block_table": (1, blk), "cu_seqlens_q": (2,), "seqused_k": (1,)},
-        {"max_seqlen_q": L, "max_seqlen_k": S, "max_block_num": blk}
-    )
-    mod, params = tvm.relay.frontend.from_onnx(
-        model, {"q": (L, H, HS), "k_cache": (blk, KV, BS, HS), "v_cache": (blk, KV, BS, HS),
-                "block_table": (1, blk), "cu_seqlens_q": (2,), "seqused_k": (1,)})
-    fbs_model = dyn.to_teco_infer_dyn(mod, {}, "teco_dyn")
-    engine = tecoinference.Engine(fbs_model)
-    ctx = engine.create_context()
-
-    ctx.set_input(0, q)
-    ctx.set_input(1, kc)
-    ctx.set_input(2, vc)
-    ctx.set_input(3, bt)
-    ctx.set_input(4, cu)
-    ctx.set_input(5, sq)
-    ctx.executor_run()
-    out = ctx.get_output(0)
-    print(f"OK (shape={out.shape})")
+    _run_case("decode", [1], [128], 43)
 
 
 def test_chunked_prefill():
-    """chunked prefill: L=32, S=64"""
-    print("  chunked prefill (L=32, S=64)...", end=" ")
-    H, KV, HS, BS = 8, 4, 64, 64
-    L, S = 32, 64
-    blk = (S + BS - 1) // BS
-    np.random.seed(44)
+    _run_case("chunked_prefill", [32], [64], 44)
 
-    q = np.random.randn(L, H, HS).astype(np.float16)
-    kc = np.random.randn(blk, KV, BS, HS).astype(np.float16)
-    vc = np.random.randn(blk, KV, BS, HS).astype(np.float16)
-    bt = np.zeros((1, blk), dtype=np.int32)
-    cu = np.array([0, L], dtype=np.int32)
-    sq = np.array([S], dtype=np.int32)
 
-    model = create_plugin_onnx_model(
-        {"q": (L, H, HS), "k_cache": (blk, KV, BS, HS), "v_cache": (blk, KV, BS, HS),
-         "block_table": (1, blk), "cu_seqlens_q": (2,), "seqused_k": (1,)},
-        {"max_seqlen_q": L, "max_seqlen_k": S, "max_block_num": blk}
-    )
-    mod, params = tvm.relay.frontend.from_onnx(
-        model, {"q": (L, H, HS), "k_cache": (blk, KV, BS, HS), "v_cache": (blk, KV, BS, HS),
-                "block_table": (1, blk), "cu_seqlens_q": (2,), "seqused_k": (1,)})
-    fbs_model = dyn.to_teco_infer_dyn(mod, {}, "teco_dyn")
-    engine = tecoinference.Engine(fbs_model)
-    ctx = engine.create_context()
-
-    ctx.set_input(0, q)
-    ctx.set_input(1, kc)
-    ctx.set_input(2, vc)
-    ctx.set_input(3, bt)
-    ctx.set_input(4, cu)
-    ctx.set_input(5, sq)
-    ctx.executor_run()
-    out = ctx.get_output(0)
-    print(f"OK (shape={out.shape})")
+def test_mixed_batch():
+    _run_case("mixed_batch", [1, 32], [128, 64], 45)
 
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("plugin_flash_attention Test Suite")
-    print("=" * 60)
-
+    print("plugin_flash_attention numerical tests (block_size=32)")
     test_prefill()
     test_decode()
     test_chunked_prefill()
-
-    print("=" * 60)
-    print("All smoke tests passed (no crash = OK)")
-    print("=" * 60)
+    test_mixed_batch()
+    print("ALL NUMERICAL TESTS PASSED")
