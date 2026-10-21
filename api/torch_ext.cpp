@@ -125,10 +125,13 @@ void flash_attn_varlen_func_torch(
     }
     auto q_lens = q_lens_cpu.to("sdaa");
 
+    // The kernel writes every [total_q, num_heads, head_size] output element.
+    // Allocate without a device-wide clear so each call does not pay for a
+    // redundant full-output memset. The focused API test seeds a caller-
+    // provided output tensor with a sentinel and compares the complete result,
+    // so an incomplete kernel write remains observable.
     if (!out.defined()) {
-        out = torch::zeros_like(q);
-    } else {
-        out.zero_();
+        out = torch::empty_like(q);
     }
 
     tecoopsHandle_t handle = getGlobalHandle();
@@ -147,7 +150,7 @@ void flash_attn_varlen_func_torch(
     make_desc(vCacheDesc, TECOOPS_DATA_HALF, v);
     make_desc(oDataDesc, TECOOPS_DATA_HALF, out);
 
-    tecoopsFlashAttention(handle,
+    const tecoopsStatus_t status = tecoopsFlashAttention(handle,
                           max_seqlen_q, max_seqlen_k, max_block_num,
                           (const int*)q_lens.data_ptr(), (const int *)seqused_k.data_ptr(),
                           blockTableDesc, block_table.data_ptr(),
@@ -162,6 +165,17 @@ void flash_attn_varlen_func_torch(
     tecoopsDestroyTensorDescriptor(kCacheDesc);
     tecoopsDestroyTensorDescriptor(vCacheDesc);
     tecoopsDestroyTensorDescriptor(oDataDesc);
+
+    // Do not swallow the C ABI status: with the redundant output clear removed,
+    // a failed dispatch would hand the caller an uninitialised output tensor
+    // that "looks fine". The descriptors are released above, so the Python
+    // exception leaks nothing. On failure the output contents are undefined
+    // (see doc/op_docs/flash_attention.md).
+    TORCH_CHECK(status == TECOOPS_STATUS_SUCCESS,
+                "flash_attention rejected the call (status=", static_cast<int>(status),
+                ": ", tecoopsGetErrorString(status),
+                "); the output tensor was not written and its contents are "
+                "not guaranteed.");
 }
 
 void causal_conv1d_fn_torch(
