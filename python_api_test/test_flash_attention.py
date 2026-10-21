@@ -199,7 +199,8 @@ def _run_one_fa_test(
     cu_seqlens_q = cu_seqlens_q.to("sdaa")
     seqused_k = torch.tensor(kv_seq_lens, dtype=torch.int32).to("sdaa")
     bt_dev = block_table.to("sdaa")
-    out_dev = torch.empty_like(q_dev)
+    # Seed the output so a missing write cannot be hidden by an empty tensor.
+    out_dev = torch.full_like(q_dev, 7.0)
 
     tecoops.flash_attn_varlen_func(
         q_dev, k_dev, v_dev,
@@ -366,6 +367,65 @@ def test_multi_batch():
 
     return all_ok
 
+
+def test_negative_host_cu_seqlens():
+    """负例: 主机端 cu_seqlens_q 必须报错, 而不是被静默当作设备地址解释
+
+    绑定契约 (doc/op_docs/flash_attention.md): cu_seqlens_q / cu_seqlens_k
+    必须是 SDAA 设备张量 (int32 / contiguous / 与 q/k 同设备)。
+    本用例传入 CPU 张量, 断言抛出 RuntimeError 且错误信息说明该契约。
+    """
+    print("-" * 60)
+    print("negative 测试 (host cu_seqlens_q 必须抛 RuntimeError)")
+
+    q_seq_lens, kv_seq_lens = [32], [64]
+    q, kc, vc, bt = _make_random_fa_inputs(q_seq_lens, kv_seq_lens, 8, 4, 128, 32)
+    head_size = q.shape[-1]
+
+    q_dev = q.contiguous().to("sdaa")
+    k_dev = kc.contiguous().to("sdaa")
+    v_dev = vc.contiguous().to("sdaa")
+    bt_dev = bt.to("sdaa")
+    seqused_k = torch.tensor(kv_seq_lens, dtype=torch.int32).to("sdaa")
+    out_dev = torch.empty_like(q_dev)
+
+    # 主机端 (CPU) cu_seqlens_q —— 违反设备张量契约
+    cu_seqlens_q_cpu = torch.tensor([0, 32], dtype=torch.int32)
+
+    try:
+        tecoops.flash_attn_varlen_func(
+            q_dev, k_dev, v_dev,
+            max(q_seq_lens),
+            cu_seqlens_q_cpu,
+            max(kv_seq_lens),
+            torch.Tensor(),       # cu_seqlens_k (unused)
+            seqused_k,
+            1.0 / math.sqrt(float(head_size)),
+            True,
+            torch.Tensor(),       # window_size (unused)
+            bt_dev,
+            False,                # return_softmax_lse
+            out_dev,
+        )
+    except RuntimeError as e:
+        msg = str(e)
+        # 错误信息必须点明设备张量契约, 而不是任意崩溃
+        if "cu_seqlens_q" in msg and "contract" in msg:
+            print(f"  [{'negative_host_cu_seqlens':30s}] PASSED "
+                  f"(RuntimeError: {msg.splitlines()[0][:80]}...)")
+            return True
+        print(f"  [{'negative_host_cu_seqlens':30s}] FAILED "
+              f"(RuntimeError raised but contract not mentioned): {msg}")
+        return False
+    except Exception as e:  # noqa: BLE001
+        print(f"  [{'negative_host_cu_seqlens':30s}] FAILED "
+              f"(unexpected {type(e).__name__}): {e}")
+        return False
+
+    print(f"  [{'negative_host_cu_seqlens':30s}] FAILED "
+          f"(no exception raised for host cu_seqlens_q)")
+    return False
+
 # ========================================================================
 # 主入口
 # ========================================================================
@@ -388,6 +448,7 @@ if __name__ == "__main__":
         ("test_chunked_prefill",  test_chunked_prefill),
         ("test_gqa",  test_gqa),
         ("test_multi_batch",  test_multi_batch),
+        ("test_negative_host_cu_seqlens",  test_negative_host_cu_seqlens),
     ]
 
     all_passed = True
