@@ -1,0 +1,149 @@
+# Device-section order: measurement recipe
+
+This document records the byte-level A/B measurement procedure used to calibrate and verify the
+device-section-order pin in `teco/CMakeLists.txt` (option `TECO_ENABLE_DEVICE_SECTION_ORDER`,
+default `ON`). It involves no new build machinery: it reuses the standard build and the demo binary
+that the repository already produces.
+
+## Background
+
+The order of the device-code sections inside the `.sdaa_fatbin` embedded in `libteco_ops.so`
+equals the order in which the object files appear on the official link line
+(`tecocc $<TARGET_OBJECTS:ops_objs> -flto ... --sdaa-link`), which in turn equals the order of the
+`SRC_UAL_KERNEL` source list in `teco/CMakeLists.txt`. Permuting only the object order therefore
+moves the device-section VMAs; per-tile instruction-fetch behaviour of the SDAA device caches
+depends on the absolute VMA a kernel section lands on, so a few tens of bytes of section placement
+can move a µs-scale kernel by ±50%.
+
+## What the fingerprint covers (and what it does not)
+
+The configure-time fingerprint (`teco-ops device-section order: ... fingerprint=<sha1> (count=<n>)`)
+hashes only the **canonical kernel TU order** — the relative `<subdir>/<file>.scpp` list built from
+`SRC_UAL_KERNEL`. It deliberately contains no checkout path, no absolute path and no build flag.
+
+Consequences:
+
+- The fingerprint travels with the **source order**, not with the build directory: the same commit
+  hashes identically on every machine and in every checkout (that is what makes it usable as a
+  recorded expected value).
+- It does **not** model the environment in which the recorded order was measured. Every address in
+  this document was measured on a specific `(device model, SDAA driver version, TecoDNN/runtime
+  version)` triple; a different triple may map a different order into the fast slots. The
+  measurement environment is therefore a **precondition of reusing a recorded order**, e.g.:
+
+  ```text
+  recorded order : <sha1 from the accepted layout>
+  measured on     : SDAA 3.2.0, driver 3.2.0, TecoDNN 3.2.0, device <model>
+  ```
+
+  Record that triple next to the accepted fingerprint (PR body / receipt). A build on a different
+  device or runtime must treat the pin as unverified and re-measure, even though the fingerprint
+  still matches — a matching fingerprint means "same TU order", never "same device layout".
+
+## Build two trees (A/B)
+
+1. Prepare two full checkouts of the same commit, differing **only** by the device-section order
+   setting, e.g.:
+
+   ```bash
+   git clone <the repo> tree-A && cd tree-A && git checkout <rev>
+   git clone <the repo> tree-B && cd tree-B && git checkout <rev>
+   # tree-B: change the one list move / option under test in teco/CMakeLists.txt
+   ```
+
+   Nothing else may differ: same kernel TU set (no added/removed modules), same toolchain, same
+   compile options. Any kernel TU add/remove invalidates every recorded address (see
+   `teco/CMakeLists.txt` fingerprint WARNING).
+
+2. Configure + build both trees with identical arguments, e.g.:
+
+   ```bash
+   # in tree-A and tree-B alike:
+   source /opt/tecoai/setvars.sh
+   bash ./build.sh --build teco
+   ```
+
+   Optionally record the section-order fingerprint printed at configure time
+   (`teco-ops device-section order: ... fingerprint=<sha1> (count=<n>)`) for both trees to prove
+   the two arms actually differ in the intended way.
+
+## Measurement (byte-level, official fixed form)
+
+3. Keep the SDAA environment identical across arms (same device, same clocks, run A and B
+   back-to-back inside the same window — cross-window comparisons of µs-level kernels are noise
+   dominated).
+
+4. Run the official fixed-form benchmark (do **not** modify the demo or the case files):
+
+   ```bash
+   ./build/demo --gid=0 --perf_repeat=50 --warm_repeat=3 --gtest_repeat=1 \
+       --case_path=zoo/teco/<op>/test_case/<case>.prototxt | grep "Average Hardware Time"
+   ```
+
+5. Repetition protocol: for every case run **3 reps per tree**, within the same window, and score
+   the **median** of the 3 `Average Hardware Time` values. Report all raw values, not only the
+   median.
+
+6. Correctness gate: the same run's correctness comparison must stay at the existing tolerance
+   (`max_error` bit-for-bit unchanged between arms for a pure order move — an order-only change
+   must never alter numerics).
+
+## Device-layout evidence
+
+7. To see *where* a kernel was placed, hash/compare the segment table instead of trusting the
+   timing alone: extract the device section headers of the two `.sdaa_fatbin` sections of
+   `build/lib/libteco_ops.so` (e.g. dump section names, addresses, sizes with the SDAA SDK's
+   `readelf`-equivalent on the fatbin) and compare:
+   - the 34–38 device section records `(name, addr, size)` as the primary criterion — the *only*
+     byte-level difference between two pure-order arms is the section order/addresses (plus
+     compile-time-embedded source-path strings, which are path noise);
+   - a SHA-1 over the sorted-then-zipped `(name,addr,size)` list ("segment table hash") as a single
+     reproducible number for the receipt.
+
+   Do **not** use the absolute path embedded in `.rodata`/`.comment` for any decision: it depends
+   on the checkout directory and is not comparable across machines (the configure-time fingerprint
+   in `teco/CMakeLists.txt` is deliberately hashed from relative file names for the same reason).
+
+## Strict mode (opt-in CI gate)
+
+A fingerprint mismatch prints a `WARNING` and the build continues by default. That is right for a
+developer tree (a stale recorded value must not stop work) but wrong for CI: once any PR adds or
+removes a kernel TU, the recorded order no longer applies, the pin silently stops matching, and a
+layout regression can land unnoticed.
+
+CI therefore turns the mismatch into a configure failure with an explicit opt-in switch:
+
+```bash
+cmake -DTECO_ENABLE_DEVICE_SECTION_ORDER=ON \
+      -DTECO_OPS_DEVICE_SECTION_ORDER_STRICT=ON \
+      -S teco -B build/teco
+```
+
+| switch | mismatch behaviour | intended use |
+| --- | --- | --- |
+| `TECO_OPS_DEVICE_SECTION_ORDER_STRICT=OFF` (default) | `WARNING`, configure continues | developer builds |
+| `TECO_OPS_DEVICE_SECTION_ORDER_STRICT=ON` | `FATAL_ERROR`, configure stops | CI / release gate |
+
+Exemption channel (same in both modes): pass an empty expected value
+`-DTECO_OPS_DEVICE_SECTION_ORDER_EXPECTED_FP=` to disable the comparison for one configure. This
+keeps "re-measure on purpose" a conscious, greppable action instead of an ignored warning.
+
+Rationale for default OFF: turning the default into a hard failure would break every downstream
+build of a tree whose pin is intentionally stale while a measurement window is being scheduled.
+The switch is the compromise between "never silently lose the pin" (CI) and "never block an
+unrelated build" (developers).
+
+## Judging
+
+8. Verdict per move: the target op's cases must improve (median-of-3, both arms the same window);
+   the full zoo case table must show no unintended displacement regression beyond the noise band;
+   all cases must stay `PASSED`. Record both arms' raw medians, the segment-table hash of the
+   winner, and the fingerprint value of the winning source order.
+
+9. Refresh the recorded expected fingerprint: after a re-measure that accepts a new order, copy the
+   fingerprint line from the newly accepted tree's configure step into
+   `TECO_OPS_DEVICE_SECTION_ORDER_EXPECTED_FP` in `teco/CMakeLists.txt` (or pass it via
+   `-DTECO_OPS_DEVICE_SECTION_ORDER_EXPECTED_FP=<sha>`), together with the measurement environment
+   triple above. A future configure whose order no longer matches emits a `WARNING` by default
+   (build continues) and a `FATAL_ERROR` under `-DTECO_OPS_DEVICE_SECTION_ORDER_STRICT=ON`,
+   so drift is never silent and CI can gate on it.

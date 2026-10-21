@@ -25,7 +25,8 @@ if [[ " ${BUILD_TARGETS[*]} " =~ " teco " ]]; then
     cd build
     rm -rf ./teco && mkdir teco
     pushd ./teco
-        cmake ../../teco/
+        # Extra configure flags (e.g. the CI-only strict device-section-order gate).
+        cmake ../../teco/ ${TECO_OPS_CMAKE_ARGS:-}
         make -j
     popd
 fi
