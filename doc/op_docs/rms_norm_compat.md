@@ -171,3 +171,10 @@ for e in range(-30, -9):                     # 覆盖次正规区 ~ 正规区
 
 建议合入顺序：**#37 → 本 PR**，随后分别重跑 `AFFECT_OPS=rms_norm` 与
 `AFFECT_OPS=rms_norm_compat` 的 python/plugin 阶段。
+
+## 来源与追溯（Provenance）
+
+- 团队来源仓：`teco-ops-SCUdoudui` main `459992a29aadd070b4d987d99c958de40911cae8`
+- 来源提交：`b374322`
+- 官方 PR 落地提交：`8d5e44b`
+- 以上与 PR 描述一致，仅用于审计追溯；数值口径与验证结论以本文上方各节为准。
