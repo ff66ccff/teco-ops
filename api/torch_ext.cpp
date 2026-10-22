@@ -67,6 +67,13 @@ void reshape_and_cache_torch(
     // receive PyTorch stride metadata. vLLM can pass a non-contiguous fused
     // QKV view here, so materialize only the read-only inputs at this ABI
     // boundary. Cache tensors remain in-place outputs and are not copied.
+    //
+    // contiguous() is a no-op when the input already matches its own layout
+    // (the common vLLM decode path hands over contiguous tensors), so the
+    // extra copy only happens for fused-QKV views. It stays here rather than
+    // below the ABI because the UAL/kernel layer only sees raw device
+    // pointers and cannot recover strides; pushing it down would mean adding
+    // a stride contract to the C ABI.
     auto key_dense = key.contiguous();
     auto value_dense = value.contiguous();
     int num_tokens = key_dense.size(0);
