@@ -112,7 +112,12 @@ def collect_ops(filenames):
                     if len(parts) >= 5:
                         # a real file inside the container: only the file part participates
                         add_resolved([parts[-1]], parts[-1], ops, public_ops)
-                    # a bare container dir path is not an operator: emit nothing
+                    else:
+                        # A bare container dir path is not an operator. Say so on stderr
+                        # (stdout stays the machine-readable AFFECT_OPS list) so a CI log
+                        # reader can tell an intentional exclusion from a silent gap.
+                        sys.stderr.write(
+                            '[get_op] skip shared operator container: %s\n' % parts[3])
                 else:
                     add_resolved([parts[3], parts[-1]], parts[3], ops, public_ops)
         elif filename.startswith('teco/ual/kernel/'):
