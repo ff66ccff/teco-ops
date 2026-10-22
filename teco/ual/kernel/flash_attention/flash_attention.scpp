@@ -188,6 +188,13 @@ __device__ __always_inline void flash_attention_half(FlashAttentionArgs args) {
     // constant per instantiation and no branch is added to any loop.  Every row-scoped quantity
     // below (cur_BM_q, cur_BM, the output DMA row count) is expressed in UQ for that reason.
     constexpr int UQ = (BM == 64) ? (BM / 2) : BM;
+    // The NT-form staging below walks Q^T in 16-lane vectors and steps the Q block by
+    // `parts * UQ`, so the Q-block stride must stay a multiple of the 16-wide SIMD width.
+    // UQ is the only compile-time knob here; BK (head_dim) and BN (== block_size) are
+    // runtime values, so their preconditions (BK % 16 == 0, BN == 32) are bound once at
+    // dispatch in find_flash_attention.cpp instead of being branched on in this loop nest.
+    static_assert(UQ % 16 == 0,
+                  "flash_attention BM32/64 Q-block stride must be a multiple of 16");
     int parts = 1;
     if constexpr (BM == 128 || BM == 64) {
         parts = MAX(1, MIN(2, args.spe_num / args.local_head_num));
