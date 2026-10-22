@@ -265,6 +265,10 @@ tecoops.flash_attn_varlen_func(
   （`q_seq_lens[b] = cu_seqlens_q[b + 1] - cu_seqlens_q[b]`），因此 `cu_seqlens_q[0]` 必须为 0、
   且序列长度不能为负；非单调输入会派生出负长度，kernel 侧不保证行为（当前不做额外的主机侧
   校验，以免引入 D2H 同步）。这是本 PR 相对旧“主机端读取”路径新增的前置条件。
-- 长度为 0 的序列（`cu_seqlens_q[b] == cu_seqlens_q[b + 1]`）在该 ABI 下是有定义的输入：
-  它派生出 `q_seq_lens[b] == 0`，对应 batch 不产生 query 行。当前测试未固化该行为，
-  建议后续补一个含 0 长度 batch 的用例；在补测之前，调用方不应依赖 0 长度 batch 的输出行内容。
+- 长度为 0 的序列（`cu_seqlens_q[b] == cu_seqlens_q[b + 1]`）在该 ABI 下是**有定义的输入**：
+  它派生出 `q_seq_lens[b] == 0`，该 batch 不产生 query 行，也不写任何输出元素。
+  这不是假想形状：vLLM v1 会把 batch 补齐到 cudagraph 尺寸，补齐出来的序列 query 长度即为 0
+  （上游 `vllm/v1/attention/backends/gdn_attn.py` 显式注明 “Exclude zero-length padded sequences
+  from prefill count”），所以变长后端必须容忍 `q_seq_lens[b] == 0`。
+  回归用例见 `python_api_test/test_flash_attention.py::test_zero_length_padded_batch`
+  （`q_lens = [0, 2]` 与 `[3, 0, 2]`，断言不崩、非零序列输出与参考一致）。
