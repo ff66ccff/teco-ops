@@ -261,3 +261,10 @@ tecoops.flash_attn_varlen_func(
 - 该变更只影响“长度从哪里读”，不改变 mask 语义、分页寻址或输出 dtype；`cu_seqlens_q`
   仍表示累计长度（`[batch+1]`），`seqused_k` 仍表示每 batch 实际 KV 长度（`[batch]`）。
 - 依赖旧“主机端读取”行为的第三方调用方需要自行把长度张量搬到设备端后再调用。
+- **`cu_seqlens_q` 必须单调不减**：绑定层用相邻元素差分得到每 batch 的 query 长度
+  （`q_seq_lens[b] = cu_seqlens_q[b + 1] - cu_seqlens_q[b]`），因此 `cu_seqlens_q[0]` 必须为 0、
+  且序列长度不能为负；非单调输入会派生出负长度，kernel 侧不保证行为（当前不做额外的主机侧
+  校验，以免引入 D2H 同步）。这是本 PR 相对旧“主机端读取”路径新增的前置条件。
+- 长度为 0 的序列（`cu_seqlens_q[b] == cu_seqlens_q[b + 1]`）在该 ABI 下是有定义的输入：
+  它派生出 `q_seq_lens[b] == 0`，对应 batch 不产生 query 行。当前测试未固化该行为，
+  建议后续补一个含 0 长度 batch 的用例；在补测之前，调用方不应依赖 0 长度 batch 的输出行内容。
