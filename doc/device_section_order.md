@@ -147,3 +147,28 @@ unrelated build" (developers).
    triple above. A future configure whose order no longer matches emits a `WARNING` by default
    (build continues) and a `FATAL_ERROR` under `-DTECO_OPS_DEVICE_SECTION_ORDER_STRICT=ON`,
    so drift is never silent and CI can gate on it.
+## Pinned relative order (what `TECO_ENABLE_DEVICE_SECTION_ORDER=ON` enforces)
+
+The pin is a sequence of existence-guarded `list(FIND)` / `list(REMOVE_AT)` / `list(INSERT)` moves,
+so it is idempotent and degrades to a no-op when an anchor TU is absent (e.g. on a tree where the
+owning PR has not landed). The **relations** below are the contract; the absolute positions follow
+from the rest of the glob order and are therefore allowed to shift with unrelated TU additions:
+
+| Relation (left is linked before right) | Why it is pinned |
+| --- | --- |
+| `zz_ms_deform_attn_backward_ha` → `weight_stream_gemv` | R17 one-TU swap that lands WSG in its measured fast class |
+| `weight_stream_gemv` → `rms_norm_compat` | A3: the arrangement that also puts `rotary_embedding` into its measured slot |
+| `z_reshape_and_cache_dma` → `zzz_flash_attention_d128` | packs the contributor TUs behind WSG |
+| `zzz_flash_attention_d128` → `z_ms_deform_attn_forward_span` | same |
+
+### How to assert it
+
+1. Configure with `-DTECO_ENABLE_DEVICE_SECTION_ORDER=ON` and read the printed fingerprint line
+   (`teco-ops device-section order: ... fingerprint=<sha1> (count=<n>)`); a changed count means a
+   TU was added/removed and every recorded address must be re-measured.
+2. Run the configure step a second time — the moves are idempotent, so the fingerprint must not change.
+3. For a hard gate in CI, configure with `-DTECO_OPS_DEVICE_SECTION_ORDER_STRICT=ON` plus
+   `-DTECO_OPS_DEVICE_SECTION_ORDER_EXPECTED_FP=<sha1>`: a mismatch fails the configure step instead
+   of being discovered from a device-side measurement.
+4. Absence of an anchor (a TU whose PR has not landed) must produce a *no-op*, not a failure; that is
+   why the moves are guarded by `GREATER -1` rather than requiring the anchor.
