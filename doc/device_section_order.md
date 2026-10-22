@@ -172,3 +172,21 @@ from the rest of the glob order and are therefore allowed to shift with unrelate
    of being discovered from a device-side measurement.
 4. Absence of an anchor (a TU whose PR has not landed) must produce a *no-op*, not a failure; that is
    why the moves are guarded by `GREATER -1` rather than requiring the anchor.
+
+## Propagating the pin to other operators
+
+A section-order move is only justified by a *measurement*, never by analogy: the fast/slow classes
+are address-specific and can differ by tens of percent between two addresses ~0x400 apart, while an
+unrelated TU change can shift the whole device image and silently flip an operator's class. The
+protocol that produced the relations above therefore has to be repeated for any new operator:
+
+1. Build two artefacts from the **same source tree and same build root**, differing only in the
+   link order (or only in the `.so`), and interleave the arms in one measurement window.
+2. Use the official fixed form (`./build/demo --gid=0 --perf_repeat=50 --warm_repeat=3`) or the
+   project's A/B harness with 3 repetitions, report the median, and repeat the window once more.
+3. Accept a move only if the target case improves and the **whole case table** does not regress
+   beyond noise (a single-case win is not enough; the layout tax is paid by every other operator).
+4. Record the resulting relation here and re-calibrate the fingerprint; if the class cannot be
+   reproduced in a second window, drop the move instead of keeping an unexplained 2–3 %.
+5. A move for `reshape_and_cache` / `rms_norm` / `rotary_embedding` must be measured with that
+   operator's own cases; the WSG numbers in this file are **not** transferable evidence.
