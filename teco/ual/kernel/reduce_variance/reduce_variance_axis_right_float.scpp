@@ -44,6 +44,13 @@ using namespace sdaa;  // NOLINT
 #define EXDBF buf_dbflag = 1 - buf_dbflag
 
 // caculate_large_variance
+//
+// Stride contract: `aligned_col` is the row stride of `x`; the dispatch layer
+// rounds the per-SPE column budget up to 16 and floors it at 16, so it is always
+// a non-zero multiple of 16 and never smaller than `cur_col`. The 16-lane loop
+// stops at `col_idx <= cur_col - 16`, so it reads at most `cur_col` columns of a
+// row and cannot run past the row end; the scalar tail right after it covers the
+// `cur_col % 16` remainder. Keep this bound if the vector width ever changes.
 __device__ static __always_inline void caculate_large_variance(float* x, float* mean, float* square,
                                                                const int cur_col, const int cur_row,
                                                                const int aligned_col) {
