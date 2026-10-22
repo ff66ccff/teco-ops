@@ -135,6 +135,19 @@ for b in batch:
 | case_1 | batch=2, totalSeqLen=16, dim=256, width=4              | OK   |
 | case_2 | batch=2, totalSeqLen=1024, dim=1280, width=4, pad_skip | OK   |
 
+官方固定形态 AHT（`./build/demo --gid=0 --perf_repeat=50 --warm_repeat=3`，
+同 build root 两臂、3 次重复取中位）：
+
+| case | 基线 `39e33e0` | 本 head | 倍数 |
+| --- | --- | --- | --- |
+| case_0（batch=1, seq=8, dim=2048） | 12.42 ms | 0.020977 ms | ≈592× |
+| case_1（batch=2, seq=16, dim=256） | 24.249 ms | 0.039908 ms | ≈608× |
+
+基线是旧实现“每 token 16 次标量 `expf` + 逐列标量写”的 zoo 平均硬件时间；本实现为
+32-SPE × 16-lane SIMD（16-lane `vexp` + `simd_vfdivs`）。两臂 `max_error` 均为 0，
+39/39 PASSED。中间的 `a958eea` head 曾测得 0.050733 / 0.098941 ms（≈245×），
+后续 SIMD 重写进一步降到上表数值；引用加速比时请注明对应的 head。
+
 ## 分支派发
 
 | 算法取值                 | 计算分支                          | 含义说明                   |
