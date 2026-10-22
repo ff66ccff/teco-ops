@@ -190,3 +190,42 @@ protocol that produced the relations above therefore has to be repeated for any 
    reproduced in a second window, drop the move instead of keeping an unexplained 2–3 %.
 5. A move for `reshape_and_cache` / `rms_norm` / `rotary_embedding` must be measured with that
    operator's own cases; the WSG numbers in this file are **not** transferable evidence.
+## Device measurement: what one move actually buys (c50, 2026-10-22)
+
+Measurement tree: a control tree that carries the `weight_stream_gemv` kernel TU and `rms_norm`
+(the other pin anchors do not exist there), so exactly **one** move is enabled: `weight_stream_gemv.scpp`
+immediately before `rms_norm_fp16.scpp`, using the same existence-guarded FIND/REMOVE_AT/INSERT idiom
+as the delivered pin. Both arms are built from the **same build root**; only the kernel TU order differs,
+and the configure fingerprints differ (`b61cee1b…` base vs `84b0a11e…` pin), which proves the move is real.
+
+Command: `./build/demo --gid=0 --perf_repeat=50 --warm_repeat=3 --gtest_repeat=1`, 3 reps, median.
+SCU SDAA single card, SDAADriver/SDAARuntime 3.2.0, identical `libteco_ops.so` except link order.
+
+| case | base (ms) | pin (ms) | Δ |
+| --- | --- | --- | --- |
+| wsg case_0 (256×256) | 0.008731 | 0.003833 | **−56.10%** |
+| wsg case_1 (512×512) | 0.011236 | 0.006713 | **−40.25%** |
+| wsg case_2 (64×256) | 0.006041 | 0.002890 | **−52.17%** |
+| wsg case_3 (192×48) | 0.007525 | 0.003180 | **−57.74%** |
+| wsg case_4 (1024×2048) | 0.035139 | 0.032372 | −7.87% |
+| wsg case_5 (128×2032) | 0.010024 | 0.006566 | −34.50% |
+| wsg case_6 (3840×2048, real) | 0.082577 | 0.079278 | −4.00% |
+| wsg case_7 (3840×4096, real) | 0.146140 | 0.143050 | −2.11% |
+| wsg case_8 (4096×3840, real) | 0.145540 | 0.143050 | −1.71% |
+| wsg case_9 (5120×3840, real) | 0.204740 | 0.203690 | −0.51% |
+| **rms_norm case_0** | 0.122870 | 0.125160 | **+1.86%** |
+| reshape_and_cache case_0 | 0.133670 | 0.133650 | −0.01% |
+| reduce_variance case_0 | 0.058042 | 0.057788 | −0.44% |
+
+All `max_error` values are bit-identical between the two arms.
+
+### What this measurement says
+
+1. **The pinned benefit is real but shape-dependent**: small/medium shapes gain 35–58 % (dispatch /
+   i-cache bound), while the real model-scale shapes gain only 0.5–4 % because they are dominated by
+   weight bandwidth and the address class only moves the constant overhead.
+2. **The cost lands on the displaced neighbour**, not on untouched operators: `rms_norm` — the very
+   anchor the move steps over — regresses +1.86 %, while operators whose sections did not move
+   (`reshape_and_cache`, `reduce_variance`) stay inside noise (−0.01 %, −0.44 %).
+3. **Therefore the benefit is not transferable by analogy**: a move for another operator needs its own
+   two-arm measurement *plus* the neighbour-cost accounting; this is exactly the protocol above.
