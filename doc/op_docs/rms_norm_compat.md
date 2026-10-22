@@ -178,3 +178,20 @@ for e in range(-30, -9):                     # 覆盖次正规区 ~ 正规区
 - 来源提交：`b374322`
 - 官方 PR 落地提交：`8d5e44b`
 - 以上与 PR 描述一致，仅用于审计追溯；数值口径与验证结论以本文上方各节为准。
+## 真实 shape 覆盖（zoo）
+
+模型侧真实调用形状取自 Gemma-4-12B 的 T1 逐位证据（2026-10-12，
+`op_learning/norm/gemma-rmsnorm-compat-t1-20261011/evidence/numeric-t1-85shapes.json`：85 个 case，
+`max_ulp = 0` 且 `bit_identical = true`）：
+
+| 真实 case | shape | has_weight | residual | 覆盖位置 |
+| --- | --- | --- | --- | --- |
+| hidden2d（final norm） | `[1, 3840]` | 是 | 否 | python 测试 |
+| q_full / k_full / v_full | `[1, 8, 512]` / `[1, 1, 512]` | 是 / 否 | 否 | `case_2`（D=512，epilogue-only） |
+| 残差 add 路径 | `[1, 8, 512]` 等 | 是 | 是 | `case_3`（D=512 + residual） |
+| prefill 行数扫描 | `[2..64, 3840]` | 是 | 否 | python 测试 |
+| 原 zoo 几何 | `[64, 4096]` / `[32, 4096]` | 是 | 否 / 是 | `case_0` / `case_1` |
+
+zoo 原来的 2 个 case 只覆盖 D=4096；新增 `case_2` / `case_3` 把 **D=512**（Gemma full-attention
+投影宽度）与 **D=512 + residual** 补进来，与真实调用宽度对齐；D=3840 的 final-norm 宽度已由
+python 测试的 85 个 case 逐位覆盖，不重复搬进 zoo。
