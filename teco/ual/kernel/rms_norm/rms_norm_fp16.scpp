@@ -27,7 +27,17 @@
 // rms_norm: RMS Normalization + optional residual add
 // 数据搬运: memcpy_async + memcpy_wait + MemcpyHandle (双缓冲流水)
 // 多核划分: Hal Tile R1C32_CR
-
+//
+// Provenance (measured/documented on 2026-10-08, documentation commit
+// 082fd26e5a452458dbc0f8814023e085da55bb13):
+//   plain-DMA kernel commit 41545fd5ee327fc61be92601bdd03dae990432ca,
+//     exported from remote source 1a0b3e77c46ebb4160df413101049f31db38f11e
+//   kernel SHA256 93e8e80d08d401fffaa3060bf8e6e24bd989ab59fd8cb09c079228710f66d5b7
+//   core   SHA256 ed1358d69c9e9a7e8137cdea7626ba75c95c8d6963303aba4b6fea217fed14c9
+//   ext    SHA256 e34873d808b1cdddfede7abe434fb667cb6d391849f9b0ae10d461dec93ffea6
+//   baseline e29b53c / 2949f70 on official main de27305efed0a17ae926d21d5415d8b915614649
+// Recorded for audit only: the source below is the single source of truth and
+// these hashes do not gate the build.
 #include <simd.h>
 #include <slave.h>
 

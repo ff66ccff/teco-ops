@@ -115,6 +115,7 @@ def test_rms_norm():
     norm_cases = [
         (128,  1e-6),
         (128,  1e-5),
+        (513,  1e-6),   # hidden % 16 != 0: exercises the scalar epilogue tail
         (1536, 1e-6),
         (2048, 1e-5),
         (4096, 1e-6),
@@ -141,6 +142,7 @@ def test_rms_norm_add():
 
     # (hidden_size, eps) 配对
     add_cases = [
+        (513,  1e-6),   # same hidden % 16 != 0 tail coverage as test_rms_norm
         (1536, 1e-6),
         (2048, 1e-5),
         (4096, 1e-6),
