@@ -124,6 +124,23 @@ ALGO0 至少分配 `1152 * size_per_head + 27136` 字节 SPM（另加 block tabl
 因此从 192 起的 32 对齐维度已超过预算，统一拒绝，
 包括 D256/D512；本 PR 不声称支持这些维度。
 
+分发判定表（实现见 `teco/ual/ops/flash_attention/find_flash_attention.cpp`，
+逐项与代码返回值核对，不满足即 fail-closed）：
+
+| 输入条件 | 支持 | 分发结果 |
+| --- | --- | --- |
+| `size_per_head % 32 == 0` 且 `block_size == 32` 且 SPM 预算内 | ✅ | 走 ALGO0 |
+| `size_per_head % 32 != 0`（含 `head_dim=48`） | ❌ | `NOT_IMPLEMENTED` → C API `TECOOPS_STATUS_NOT_SUPPORTED`(6) |
+| `block_size != 32`（含 KV 页长 64/128） | ❌ | 同上（6） |
+| `size_per_head >= 192`（SPM > 235 KiB，含 D256/D512） | ❌ | 同上（6） |
+| `size_per_head <= 0` 或 `block_table_dim <= 0` | ❌ | 同上（6） |
+| 非 half / 非连续 / 描述符维度不符 | ❌ | `TECOOPS_STATUS_BAD_PARAM`(3)，参数校验层拒绝 |
+
+本分支的 `findFlashAttentionBranch()` 只返回 `algo = 0`，因此不存在对算法表
+的越界索引；若后续重新接入 D256/D512，必须**在同一个提交内**同时补齐 kernel
+声明、算法表条目与分发下标，并让分发下标在取表前做 `[0, count)` 一致性检查，
+避免出现“表项缺失但下标有效”的静默越界。
+
 Plugin 的第五个输入现在明确为 `q_seq_lens: int32[batch_size]`，例如两条 query
 长度为 1 和 32 时传 `[1, 32]`。旧名称 `cu_seqlens_q` 与实现所需的实际长度不符，
 原实现把累计值直接交给 kernel，未做差分，不能正确执行旧累计格式的图。
