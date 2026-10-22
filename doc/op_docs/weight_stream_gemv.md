@@ -268,3 +268,22 @@ tecoopsWeightStreamGemv(handle, x_dptr, w_dptr, y_dptr, n, k);
 
 tecoopsDestroy(handle);
 ```
+
+## 真实 decode shape 覆盖（zoo）
+
+模型侧真实 M=1 decode shape 由 live launch census 实测（Gemma-4-12B、TP=2 单 rank、
+2026-10-11；原始数据 `op_learning/gemm/gemma-gemv-fallback-census-20261011/raw/ls-shapes-*.tsv`）：
+
+| N | K | 每代调用次数 | zoo 用例 |
+| --- | --- | --- | --- |
+| 3840 | 2048 | 7440 | `case_6` |
+| 3840 | 4096 | 1488 | `case_7` |
+| 4096 | 3840 | 7440 | `case_8` |
+| 5120 | 3840 | 1488 | `case_9` |
+| 3840 | 7680 | 8928 | 未纳入：权重 59 MB，官方 `perf_repeat=50` 下单例成本过高 |
+| 15360 | 3840 | 4464 | 未纳入：权重 118 MB |
+| 131072 | 3840 | 96 | 未纳入：权重 1.0 GB（embedding 行），不属 zoo 可测范围 |
+
+连同 `case_2..case_5` 的契约边界（`n = 64/128/192`、`k = 48/2032`），zoo 现在覆盖
+`n % 64 == 0`、`k % 16 == 0` 的主要取值组合，以及 `xspm32` 的 `k % 32 == 16` 分支。
+其余三个模型的 decode shape 需各自跑一次同口径 census 后再补；本 PR 不跨模型臆造 shape。
