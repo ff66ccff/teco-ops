@@ -368,6 +368,32 @@ def test_multi_batch():
     return all_ok
 
 
+def test_zero_length_padded_batch():
+    """0 长度 padded 序列（vLLM cudagraph padding 的真实形态）。
+
+    vLLM v1 的 attention metadata 会把 batch 补齐到 cudagraph 尺寸，补齐出来的序列
+    query 长度为 0（vllm/v1/attention/backends/gdn_attn.py 里显式 "Exclude zero-length
+    padded sequences from prefill count"）。这里构造 q_lens 含 0 的变长 batch，断言：
+      * kernel 不崩、其余序列的输出与参考逐元素一致；
+      * 0 长度 batch 不产生任何输出行（total_q 只累加非零长度）。
+    """
+    print("-" * 60)
+    print("zero-length padded 测试 (q_lens 含 0)")
+    all_ok = True
+
+    cases = [
+        ("zero_len_leading", 8, 4, 128, 32, [0, 2], [64, 64]),
+        ("zero_len_middle", 8, 4, 128, 32, [3, 0, 2], [32, 64, 96]),
+    ]
+
+    for name, H, KV, HS, BS, q_lens, kv_lens in cases:
+        q, kc, vc, bt = _make_random_fa_inputs(q_lens, kv_lens, H, KV, HS, BS)
+        ok, _ = _run_one_fa_test(q, kc, vc, q_lens, kv_lens, bt, label=name)
+        all_ok = all_ok and ok
+
+    return all_ok
+
+
 def test_negative_host_cu_seqlens():
     """负例: 主机端 cu_seqlens_q 必须报错, 而不是被静默当作设备地址解释
 
@@ -448,6 +474,7 @@ if __name__ == "__main__":
         ("test_chunked_prefill",  test_chunked_prefill),
         ("test_gqa",  test_gqa),
         ("test_multi_batch",  test_multi_batch),
+        ("test_zero_length_padded_batch",  test_zero_length_padded_batch),
         ("test_negative_host_cu_seqlens",  test_negative_host_cu_seqlens),
     ]
 
