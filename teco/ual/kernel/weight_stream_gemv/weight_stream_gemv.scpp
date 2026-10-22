@@ -149,6 +149,14 @@ __global__ void teco_slave_weight_stream_gemv(WeightStreamGemvArgs args) {
     cur += (64 - (reinterpret_cast<unsigned long>(cur) & 63UL)) & 63UL;
     half *xspm = reinterpret_cast<half *>(cur);
     cur += x_bytes;
+    // 64 B re-align after the fp16 activation row: x_bytes = K * sizeof(half) is
+    // only a multiple of 64 when K % 32 == 0.  For K % 32 == 16 (e.g. K = 48 or
+    // 2032) the fp32 activation buffer below would land 32 B aligned while the
+    // vector loop uses 64 B simd_load/simd_store on it, which the device rejects
+    // with SDAA_ERROR_MISALIGNED_ADDRESS during warm-up (measured on the c50
+    // zoo cases case_3 = 192x48 and case_5 = 128x2032).  This is entry-time
+    // pointer arithmetic, not a hot-path branch.
+    cur += (64 - (reinterpret_cast<unsigned long>(cur) & 63UL)) & 63UL;
     float *xspm32 = reinterpret_cast<float *>(cur);
     cur += x32_bytes;
     half *wbuf0 = reinterpret_cast<half *>(cur);
