@@ -95,6 +95,16 @@ class PluginFlashAttentionImpl : public AbstractPluginOp {
       tecoopsSetTensorNdDescriptor(desc, dtype, shape.size(), shape.data(), nullptr);
     };
 
+    // Descriptor <-> host-side argument mapping (ual/args/flash_attention_args.h):
+    //   blockTableDesc <- block_table  [batch_size, block_table_dim]   int32
+    //   qDataDesc      <- q            [total_q, num_heads, head_size] half
+    //   kCacheDesc     <- k_cache      [num_blocks, kv_heads, block_size,
+    //                                   head_size]                    half
+    //   vCacheDesc     <- v_cache      same layout as k_cache           half
+    //   oDataDesc      <- output       same shape/dtype as q            half
+    // Every shape comes from GetInputShape() instead of being derived from the
+    // attrs, so a graph whose cache shapes disagree with max_block_num still
+    // gets descriptors that describe the tensors actually bound to the op.
     tecoopsTensorDescriptor_t blockTableDesc, qDataDesc, kCacheDesc, vCacheDesc, oDataDesc;
     make_desc(blockTableDesc, TECOOPS_DATA_INT32, bt_shape);
     make_desc(qDataDesc, TECOOPS_DATA_HALF, q_shape);
