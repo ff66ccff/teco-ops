@@ -222,3 +222,20 @@ Teco-Inference 插件侧对该反向算子的覆盖为**零**。若推理侧需�
 本 PR 的验证范围以 `python_api_test/test_ms_deform_attn_backward*.py` 与
 `test/zoo/teco/ms_deform_attn_backward/` 为限；`once_differentiable` 的语义边界（一阶可用、
 二阶不支持）见上文。
+
+## List 容量上限与越界行为
+
+本算子的 list 形态（`*_list` / `*_offsets` 入口）用 int32 节点编号索引 workspace，
+容量在进入 UAL 之前由 `teco/interface/common/ms_deform_attn_list_capacity.h` 的
+`msdaListCount()` 一次性校验（乘之前在 int64 上做溢出检查，任一因子非正即拒绝）：
+
+| 计数 | 定义 | 上限 |
+| --- | --- | --- |
+| `head_count` | `batch × value_len × num_heads` | `INT32_MAX` |
+| `node_count` | `4 × batch × num_queries × num_heads × num_levels × num_points` | `INT32_MAX` |
+
+- C API：任一计数溢出时返回 `TECOOPS_STATUS_BAD_PARAM`(3)，不启动 kernel、不做部分写入。
+- Python 绑定：同一校验由 `TORCH_CHECK` 触发并抛 `RuntimeError`
+  （消息 `MSDeformAttn list workspace counts must fit int32`）。
+- 该上限是**工作空间索引位宽**约束，不是精度或显存上限；显存不足由分配失败单独暴露。
+  边界形状（D=1/31/32/128、batch=1 等）不触发该上限。

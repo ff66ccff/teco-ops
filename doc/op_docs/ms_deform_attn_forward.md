@@ -56,3 +56,20 @@ Fixed seed1234 random-weight official 6encoder/6decoder transformer no_grad forw
 `teco/plugin/pluginMsDeformAttn{Forward,Backward}/` 与对应的
 `plugin_test/test_plugin_ms_deform_attn_*.py`，不能假定现有 Python 测试能代表插件行为。
 本 PR 声明的验证范围以 `python_api_test/` 与 `test/zoo/teco/ms_deform_attn_forward/` 为限。
+
+## List 容量上限与越界行为
+
+本算子的 list 形态（`*_list` / `*_offsets` 入口）用 int32 节点编号索引 workspace，
+容量在进入 UAL 之前由 `teco/interface/common/ms_deform_attn_list_capacity.h` 的
+`msdaListCount()` 一次性校验（乘之前在 int64 上做溢出检查，任一因子非正即拒绝）：
+
+| 计数 | 定义 | 上限 |
+| --- | --- | --- |
+| `head_count` | `batch × value_len × num_heads` | `INT32_MAX` |
+| `node_count` | `4 × batch × num_queries × num_heads × num_levels × num_points` | `INT32_MAX` |
+
+- C API：任一计数溢出时返回 `TECOOPS_STATUS_BAD_PARAM`(3)，不启动 kernel、不做部分写入。
+- Python 绑定：同一校验由 `TORCH_CHECK` 触发并抛 `RuntimeError`
+  （消息 `MSDeformAttn list workspace counts must fit int32`）。
+- 该上限是**工作空间索引位宽**约束，不是精度或显存上限；显存不足由分配失败单独暴露。
+  边界形状（D=1/31/32/128、batch=1 等）不触发该上限。
