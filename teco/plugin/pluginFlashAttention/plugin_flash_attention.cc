@@ -91,7 +91,9 @@ class PluginFlashAttentionImpl : public AbstractPluginOp {
     ctx->GetAttr("max_seqlen_k", max_seqlen_k);
     ctx->GetAttr("max_block_num", max_block_num);
     int64_t has_softmax_scale = 0;
-    double softmax_scale = 0.0;
+    // GetAttr exposes float/int64_t overloads only (cf. pluginRmsNorm eps);
+    // the TVM attr stays double and the SDK converts on read.
+    float softmax_scale = 0.0f;
     ctx->GetAttr("has_softmax_scale", has_softmax_scale);
     ctx->GetAttr("softmax_scale", softmax_scale);
     if (has_softmax_scale != 0 &&
