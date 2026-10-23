@@ -269,6 +269,93 @@ def test_mixed_batch():
     print(f"OK (max_err={max_err:.6f})")
 
 
+def test_batch1():
+    """batch=1 reference check: cu_seqlens_q=[0, L] with L=64, S=64."""
+    print("  batch=1 (L=S=64, offset=[0, 64])...", end=" ")
+    B, H, KV, HS, BS = 1, 8, 4, 64, 32
+    L = S = 64
+    blk = (S + BS - 1) // BS
+    np.random.seed(46)
+
+    q = np.random.randn(L, H, HS).astype(np.float16)
+    kc = np.random.randn(blk, KV, BS, HS).astype(np.float16)
+    vc = np.random.randn(blk, KV, BS, HS).astype(np.float16)
+    bt = np.arange(blk, dtype=np.int32).reshape(1, blk)
+    cu = np.array([0, L], dtype=np.int32)
+    sq = np.array([S], dtype=np.int32)
+
+    input_shapes = {
+        "q": (L, H, HS),
+        "k_cache": (blk, KV, BS, HS),
+        "v_cache": (blk, KV, BS, HS),
+        "block_table": (1, blk),
+        "cu_seqlens_q": (2,),
+        "seqused_k": (1,),
+    }
+    model = create_plugin_onnx_model(
+        input_shapes,
+        {"max_seqlen_q": L, "max_seqlen_k": S, "max_block_num": blk}
+    )
+    mod, params = tvm.relay.frontend.from_onnx(model, input_shapes)
+    fbs_model = dyn.to_teco_infer_dyn(mod, {}, "teco_dyn")
+    engine = tecoinference.Engine(fbs_model)
+    ctx = engine.create_context()
+    for index, value in enumerate((q, kc, vc, bt, cu, sq)):
+        ctx.set_input(index, value)
+    ctx.executor_run()
+    out = ctx.get_output(0)
+    assert out.shape == q.shape, f"shape mismatch: {out.shape}"
+    ref = reference_paged_flash_attention(q, kc, vc, bt, cu, sq)
+    max_err = float(np.max(np.abs(out.astype(np.float32) - ref.astype(np.float32))))
+    assert max_err < 0.1, f"batch=1 max_err={max_err}"
+    print(f"OK (shape={out.shape}, max_error={max_err:.6f})")
+
+
+def test_irregular_q_lens():
+    """Irregular q lengths: batch=3, cu_seqlens_q=[0, 1, 4, 6] (q_lens=[1, 3, 2])."""
+    print("  irregular q lengths (B=3, q=[1,3,2], kv=[64,64,64])...", end=" ")
+    B, H, KV, HS, BS = 3, 4, 2, 64, 32
+    q_lens = [1, 3, 2]
+    kv_lens = [64, 64, 64]
+    total_q = sum(q_lens)
+    blocks_per_seq = max((k + BS - 1) // BS for k in kv_lens)
+    num_blocks = B * blocks_per_seq
+    np.random.seed(47)
+
+    q = np.random.randn(total_q, H, HS).astype(np.float16)
+    kc = np.random.randn(num_blocks, KV, BS, HS).astype(np.float16)
+    vc = np.random.randn(num_blocks, KV, BS, HS).astype(np.float16)
+    bt = np.arange(num_blocks, dtype=np.int32).reshape(B, blocks_per_seq)
+    cu = np.array([0, 1, 4, 6], dtype=np.int32)
+    sq = np.array(kv_lens, dtype=np.int32)
+
+    input_shapes = {
+        "q": (total_q, H, HS),
+        "k_cache": (num_blocks, KV, BS, HS),
+        "v_cache": (num_blocks, KV, BS, HS),
+        "block_table": (B, blocks_per_seq),
+        "cu_seqlens_q": (B + 1,),
+        "seqused_k": (B,),
+    }
+    model = create_plugin_onnx_model(
+        input_shapes,
+        {"max_seqlen_q": max(q_lens), "max_seqlen_k": max(kv_lens),
+         "max_block_num": num_blocks})
+    mod, params = tvm.relay.frontend.from_onnx(model, input_shapes)
+    fbs_model = dyn.to_teco_infer_dyn(mod, {}, "teco_dyn")
+    engine = tecoinference.Engine(fbs_model)
+    ctx = engine.create_context()
+    for index, value in enumerate((q, kc, vc, bt, cu, sq)):
+        ctx.set_input(index, value)
+    ctx.executor_run()
+    out = ctx.get_output(0)
+    assert out.shape == q.shape, f"shape mismatch: {out.shape}"
+    ref = reference_paged_flash_attention(q, kc, vc, bt, cu, sq)
+    max_err = float(np.max(np.abs(out.astype(np.float32) - ref.astype(np.float32))))
+    assert max_err < 0.1, f"irregular q lengths max_err={max_err}"
+    print(f"OK (shape={out.shape}, max_error={max_err:.6f})")
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("plugin_flash_attention Test Suite")
@@ -277,7 +364,9 @@ if __name__ == "__main__":
     test_prefill()
     test_decode()
     test_chunked_prefill()
+    test_batch1()
     test_mixed_batch()
+    test_irregular_q_lens()
 
     print("=" * 60)
     # The closing banner must describe what was actually enforced. Every case
