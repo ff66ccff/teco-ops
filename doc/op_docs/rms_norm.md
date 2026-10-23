@@ -240,3 +240,14 @@ Hy/Mini 的 E29 模型结果不验证新的 DMA kernel。
 通过的 head 是 `2949f7061a05af0f4cb2b88fb3344380e3dfc4e0`，早于 plain
 DMA 提交；当前 DMA head 的官方 CI/完整 wheel、官方模型环境和组委会
 完整精度尚未验证。原始收据中的限制仍按其实际源码与构建范围保留。
+
+## Hidden-size contract
+
+- **支持**：`hidden_size % 2 == 0`（含非 32 倍数，如 514/520，靠 kernel 内 64B SPM 段步长吸收 padding）；
+- **拒绝**：`hidden_size % 2 != 0` → `TECOOPS_STATUS_BAD_PARAM` / Python `RuntimeError`（DMA 4B 粒度）；
+- **实测表**：D=513/515 设备报 ILLEGAL_ADDRESS 崩溃（修复前）、D=514/516/520 通过（修复后）。
+
+| Hidden Size ($D$) | 修复前 | 修复后 | 说明 |
+| --- | --- | --- | --- |
+| D=513 / D=515 | 设备报 ILLEGAL_ADDRESS 崩溃 (`rc=134 SDAA_ERROR_ILLEGAL_ADDRESS`) | 拦截并拒绝 (`TECOOPS_STATUS_BAD_PARAM` / Python `RuntimeError`) | 奇数 hidden size 导致 2 字节行长，违背 SDAA DMA 4 字节粒度 |
+| D=514 / D=516 / D=520 | 崩溃 | 通过 (OK, max_err ~1e-3, res_err=0) | 偶数 hidden size 满足 4 字节粒度，64B SPM 段步长吸收尾部 padding |

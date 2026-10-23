@@ -115,7 +115,8 @@ def test_rms_norm():
     norm_cases = [
         (128,  1e-6),
         (128,  1e-5),
-        (513,  1e-6),   # hidden % 16 != 0: exercises the scalar epilogue tail
+        (514,  1e-6),   # hidden % 32 != 0: even non-multiple-of-32 (64B SPM aligned)
+        (520,  1e-5),
         (1536, 1e-6),
         (2048, 1e-5),
         (4096, 1e-6),
@@ -142,7 +143,8 @@ def test_rms_norm_add():
 
     # (hidden_size, eps) 配对
     add_cases = [
-        (513,  1e-6),   # same hidden % 16 != 0 tail coverage as test_rms_norm
+        (514,  1e-6),   # same even non-multiple-of-32 coverage as test_rms_norm
+        (520,  1e-5),
         (1536, 1e-6),
         (2048, 1e-5),
         (4096, 1e-6),
@@ -191,9 +193,73 @@ def test_rms_norm_non_default_stream():
     return passed
 
 
+def test_negative_odd_hidden():
+    """负例测试：奇数 hidden_size 必须被拒绝并抛出 RuntimeError"""
+    print("=" * 60)
+    print("Test: Negative (odd hidden_size rejected)")
+    num_tokens = 64
+    hidden_size = 513
+    eps = 1e-5
+
+    all_passed = True
+
+    # 1. 纯 RMSNorm
+    x_cpu = torch.randn(num_tokens, hidden_size, dtype=torch.half)
+    w_cpu = torch.randn(hidden_size, dtype=torch.half)
+    x = x_cpu.to("sdaa")
+    w = w_cpu.to("sdaa")
+    out = torch.empty(num_tokens, hidden_size, dtype=torch.half, device="sdaa")
+    out.fill_(7.0)
+
+    pure_threw = False
+    pure_err = ""
+    try:
+        tecoops.rms_norm(x, w, None, out, None, eps)
+    except RuntimeError as e:
+        pure_threw = True
+        pure_err = str(e)
+
+    out_untouched = (out.cpu() == 7.0).all().item()
+    passed_pure = pure_threw and out_untouched
+    all_passed = all_passed and passed_pure
+    if passed_pure:
+        print(f"  pure rms_norm (hidden={hidden_size}): PASSED (RuntimeError: {pure_err})")
+    else:
+        print(f"  pure rms_norm (hidden={hidden_size}): FAILED "
+              f"(threw={pure_threw}, out_untouched={out_untouched})")
+
+    # 2. RMSNorm + residual add
+    r_cpu = torch.randn(num_tokens, hidden_size, dtype=torch.half)
+    residual = r_cpu.to("sdaa")
+    residual_out = torch.empty(num_tokens, hidden_size, dtype=torch.half, device="sdaa")
+    out.fill_(7.0)
+    residual_out.fill_(7.0)
+
+    add_threw = False
+    add_err = ""
+    try:
+        tecoops.rms_norm(x, w, residual, out, residual_out, eps)
+    except RuntimeError as e:
+        add_threw = True
+        add_err = str(e)
+
+    out_untouched_add = (out.cpu() == 7.0).all().item()
+    res_untouched_add = (residual_out.cpu() == 7.0).all().item()
+    passed_add = add_threw and out_untouched_add and res_untouched_add
+    all_passed = all_passed and passed_add
+    if passed_add:
+        print(f"  add  rms_norm (hidden={hidden_size}): PASSED (RuntimeError: {add_err})")
+    else:
+        print(f"  add  rms_norm (hidden={hidden_size}): FAILED "
+              f"(threw={add_threw}, out_untouched={out_untouched_add}, res_untouched={res_untouched_add})")
+
+    return all_passed
+
+
 if __name__ == "__main__":
     r1 = test_rms_norm()
     r2 = test_rms_norm_add()
     r3 = test_rms_norm_non_default_stream()
+    r4 = test_negative_odd_hidden()
     print()
-    print("ALL PASSED" if (r1 and r2 and r3) else "SOME FAILED")
+    print("ALL PASSED" if (r1 and r2 and r3 and r4) else "SOME FAILED")

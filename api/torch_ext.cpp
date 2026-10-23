@@ -78,6 +78,15 @@ void reshape_and_cache_torch(
         num_blocks, block_size);
 }
 
+namespace {
+inline void checkRmsNormStatus(tecoopsStatus_t status) {
+    TORCH_CHECK(status == TECOOPS_STATUS_SUCCESS,
+                "rms_norm failed with status ", static_cast<int>(status),
+                " (", tecoopsGetErrorString(status),
+                "); hidden_size must be even (DMA requires 4-byte row granularity)");
+}
+}  // namespace
+
 void rms_norm_torch(
     torch::Tensor input, torch::Tensor weight,
     c10::optional<torch::Tensor> residual,
@@ -98,10 +107,11 @@ void rms_norm_torch(
     const void *residual_ptr = residual.has_value() ? residual.value().data_ptr() : nullptr;
     void *res_out_ptr = residual_out.has_value() ? residual_out.value().data_ptr() : nullptr;
 
-    tecoopsRmsNorm(handle,
-                   input.data_ptr(), weight.data_ptr(),
-                   residual_ptr, output.data_ptr(), res_out_ptr,
-                   num_tokens, hidden_size, static_cast<float>(eps));
+    checkRmsNormStatus(tecoopsRmsNorm(
+        handle,
+        input.data_ptr(), weight.data_ptr(),
+        residual_ptr, output.data_ptr(), res_out_ptr,
+        num_tokens, hidden_size, static_cast<float>(eps)));
 }
 
 void flash_attn_varlen_func_torch(
@@ -235,11 +245,12 @@ void rms_norm_out_torch(torch::Tensor input, torch::Tensor weight, torch::Tensor
     // Same-stream binding; see the ownership note in rms_norm_torch (the
     // repo-wide unification is carried by the dedicated stream PR).
     tecoopsSetStream(handle, torch::sdaa::getCurrentSDAAStream());
-    tecoopsRmsNorm(handle,
-                   input.data_ptr(), weight.data_ptr(),
-                   nullptr, output.data_ptr(), nullptr,
-                   static_cast<int>(input.size(0)), static_cast<int>(input.size(1)),
-                   static_cast<float>(eps));
+    checkRmsNormStatus(tecoopsRmsNorm(
+        handle,
+        input.data_ptr(), weight.data_ptr(),
+        nullptr, output.data_ptr(), nullptr,
+        static_cast<int>(input.size(0)), static_cast<int>(input.size(1)),
+        static_cast<float>(eps)));
 }
 
 // Meta kernel: `out=` op returns nothing and only mutates `output`, so the fake impl
@@ -274,11 +285,12 @@ void rms_norm_add_out_torch(torch::Tensor input, torch::Tensor weight, torch::Te
     // Same-stream binding; see the ownership note in rms_norm_torch (the
     // repo-wide unification is carried by the dedicated stream PR).
     tecoopsSetStream(handle, torch::sdaa::getCurrentSDAAStream());
-    tecoopsRmsNorm(handle,
-                   input.data_ptr(), weight.data_ptr(),
-                   residual.data_ptr(), output.data_ptr(), residual_out.data_ptr(),
-                   static_cast<int>(input.size(0)), static_cast<int>(input.size(1)),
-                   static_cast<float>(eps));
+    checkRmsNormStatus(tecoopsRmsNorm(
+        handle,
+        input.data_ptr(), weight.data_ptr(),
+        residual.data_ptr(), output.data_ptr(), residual_out.data_ptr(),
+        static_cast<int>(input.size(0)), static_cast<int>(input.size(1)),
+        static_cast<float>(eps)));
 }
 
 // Meta kernel: `out=` op returns nothing and only mutates `output`/`residual_out`, so
