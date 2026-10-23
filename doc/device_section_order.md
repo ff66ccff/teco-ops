@@ -172,6 +172,16 @@ from the rest of the glob order and are therefore allowed to shift with unrelate
    of being discovered from a device-side measurement.
 4. Absence of an anchor (a TU whose PR has not landed) must produce a *no-op*, not a failure; that is
    why the moves are guarded by `GREATER -1` rather than requiring the anchor.
+5. Configure-time assertion (`TECO_OPS_DEVICE_SECTION_ORDER_ASSERT`, default `ON`): when
+   `TECO_ENABLE_DEVICE_SECTION_ORDER=ON`, CMake asserts that the anchor TU set
+   (`weight_stream_gemv/weight_stream_gemv.scpp`, `rotary_embedding/rotary_embedding_fp16.scpp`,
+   `zzz_flash_attention_d128/zzz_flash_attention_d128.scpp`) is present in `SRC_UAL_KERNEL` and
+   preserves the calibrated relative order (`weight_stream_gemv` < `rotary_embedding` <
+   `zzz_flash_attention_d128`). A missing anchor or inverted relative position triggers a
+   `FATAL_ERROR` at configure time. Exemption channel: pass
+   `-DTECO_OPS_DEVICE_SECTION_ORDER_ASSERT=OFF` to exempt the check on unmerged/intermediate
+   trees where anchor TUs have not landed, or `-DTECO_ENABLE_DEVICE_SECTION_ORDER=OFF` to disable
+   device-section ordering entirely.
 
 ## Propagating the pin to other operators
 

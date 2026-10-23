@@ -94,6 +94,10 @@ option(TECO_ENABLE_DEVICE_SECTION_ORDER "Pin the measured device-section order a
 # while CI can turn pinning drift into a hard failure.  Exemption channel: pass
 # -DTECO_OPS_DEVICE_SECTION_ORDER_EXPECTED_FP= (empty) to disable the comparison entirely.
 option(TECO_OPS_DEVICE_SECTION_ORDER_STRICT "Fail configure when the device-section-order fingerprint mismatches (opt-in CI gate)" OFF)
+# Configure-time assertion of the relative order of anchor kernel TUs.
+# Defaults to ON so refactoring or glob drift immediately fails the configure step.
+# Exemption channel: pass -DTECO_OPS_DEVICE_SECTION_ORDER_ASSERT=OFF to disable the check.
+option(TECO_OPS_DEVICE_SECTION_ORDER_ASSERT "Assert the relative order of anchor kernel TUs at configure time" ON)
 # Backward compatibility: honour the pre-rename option name once more, then retire it silently.
 if(DEFINED TECO_OPS_DEVICE_SECTION_ORDER AND NOT "x${TECO_OPS_DEVICE_SECTION_ORDER}" STREQUAL "xON")
     message(STATUS "TECO_OPS_DEVICE_SECTION_ORDER is retired; use -DTECO_ENABLE_DEVICE_SECTION_ORDER=${TECO_OPS_DEVICE_SECTION_ORDER} instead")
@@ -137,6 +141,58 @@ if(TECO_ENABLE_DEVICE_SECTION_ORDER)
     # one-TU swap is the cheapest way into the fast class and leaves flash_d128, rms_norm_fp16,
     # memset and the msdeform forward sections on their measured addresses.
     _c38_r10_move_before("${_R10K}/weight_stream_gemv/weight_stream_gemv.scpp" "${_R10K}/zz_ms_deform_attn_backward_ha/zz_ms_deform_attn_backward_ha.scpp")
+
+    # Configure-time assertion of anchor TU relative order (review recommendation).
+    # When enabled, asserts that the target anchor TUs are present in SRC_UAL_KERNEL and
+    # maintain their calibrated relative order (weight_stream_gemv < rotary_embedding < zzz_flash_attention_d128).
+    # Refactoring or glob changes that alter this relative order fail configure immediately.
+    # Exemption: pass -DTECO_OPS_DEVICE_SECTION_ORDER_ASSERT=OFF (or -DTECO_ENABLE_DEVICE_SECTION_ORDER=OFF).
+    if(TECO_OPS_DEVICE_SECTION_ORDER_ASSERT)
+        list(LENGTH SRC_UAL_KERNEL _KERNEL_COUNT)
+        set(_ANCHOR_WSG "${_R10K}/weight_stream_gemv/weight_stream_gemv.scpp")
+        set(_ANCHOR_ROT "${_R10K}/rotary_embedding/rotary_embedding_fp16.scpp")
+        set(_ANCHOR_FLASH "${_R10K}/zzz_flash_attention_d128/zzz_flash_attention_d128.scpp")
+
+        # The anchor TUs are owned by other PRs (#35/#40/#41/#44/#48); on a tree where they are
+        # not merged yet the corresponding pin moves above are inert, so the assertion requires
+        # only the *present* anchors to keep the calibrated relative order.  A missing anchor is
+        # reported as STATUS (legitimate merge-order state), while a reordered present anchor is
+        # FATAL and therefore surfaces a CMake/source-list refactor immediately.
+        set(_ANCHOR_INDICES "")
+        set(_ANCHOR_FOUND "")
+        set(_ANCHOR_NAMES
+            "weight_stream_gemv/weight_stream_gemv.scpp"
+            "rotary_embedding/rotary_embedding_fp16.scpp"
+            "zzz_flash_attention_d128/zzz_flash_attention_d128.scpp")
+        foreach(_ANCHOR ${_ANCHOR_NAMES})
+            list(FIND SRC_UAL_KERNEL "${_R10K}/${_ANCHOR}" _IDX)
+            if(_IDX EQUAL -1)
+                message(STATUS
+                    "device-section-order assertion: anchor TU '${_ANCHOR}' not present "
+                    "(expected until its owning PR is merged); ordering check skipped for it.")
+            else()
+                list(APPEND _ANCHOR_INDICES ${_IDX})
+                if(_ANCHOR_FOUND STREQUAL "")
+                    set(_ANCHOR_FOUND "${_ANCHOR}=${_IDX}")
+                else()
+                    string(APPEND _ANCHOR_FOUND ", ${_ANCHOR}=${_IDX}")
+                endif()
+            endif()
+        endforeach()
+
+        set(_PREV_INDEX -1)
+        foreach(_IDX IN LISTS _ANCHOR_INDICES)
+            if(_IDX LESS _PREV_INDEX)
+                message(FATAL_ERROR
+                    "device-section-order assertion failed: relative order mismatch among the anchors "
+                    "present in this tree (list length: ${_KERNEL_COUNT}). "
+                    "Expected relative order: weight_stream_gemv < rotary_embedding < zzz_flash_attention_d128. "
+                    "Actual: ${_ANCHOR_FOUND}. "
+                    "Exempt with -DTECO_OPS_DEVICE_SECTION_ORDER_ASSERT=OFF or -DTECO_ENABLE_DEVICE_SECTION_ORDER=OFF.")
+            endif()
+            set(_PREV_INDEX ${_IDX})
+        endforeach()
+    endif()
 endif()
 
 # Fingerprint of the final kernel TU order, so that a silent no-op (anchor TUs absent) or a silent
@@ -203,7 +259,7 @@ if(TECO_OPS_DEVICE_SECTION_ORDER_EXPECTED_FP
     endif()
 endif()
 
-message(STATUS "teco-ops device-section order: ${TECO_ENABLE_DEVICE_SECTION_ORDER} fingerprint=${TECO_OPS_SECTION_ORDER_FP} (count=${TECO_OPS_SECTION_ORDER_COUNT}) strict=${TECO_OPS_DEVICE_SECTION_ORDER_STRICT}")
+message(STATUS "teco-ops device-section order: ${TECO_ENABLE_DEVICE_SECTION_ORDER} fingerprint=${TECO_OPS_SECTION_ORDER_FP} (count=${TECO_OPS_SECTION_ORDER_COUNT}) strict=${TECO_OPS_DEVICE_SECTION_ORDER_STRICT} assert=${TECO_OPS_DEVICE_SECTION_ORDER_ASSERT}")
 
 list(APPEND SRC_ALL
     ${SRC_INTERFACE_COMMON}
