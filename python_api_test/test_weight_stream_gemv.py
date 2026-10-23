@@ -178,6 +178,13 @@ CASES = [
     (512, 2048, 45, 0.25, "decode n=512 k=2048"),
     (128, 256, 46, 0.50, "boundary n=128 (n%64==0)"),
     (64, 3072, 47, 0.50, "boundary n=64 (n%64==0)"),
+    # 10/22 review 要求的对齐回归 (k % 32 == 16, 非 64 字节对齐)
+    (192, 48, 53, 0.50, "zoo/case_3 n=192 k=48 (10/22 review 要求的对齐回归)"),
+    (128, 2032, 57, 0.50, "zoo/case_5 n=128 k=2032 (10/22 review 要求的对齐回归)"),
+    # 真实 decode shape (Gemma-4-12B census, 大 n)
+    (3840, 2048, 61, 0.50, "zoo/case_6 decode n=3840 k=2048"),
+    (3840, 4096, 63, 0.50, "zoo/case_7 decode n=3840 k=4096"),
+    (4096, 3840, 65, 0.50, "zoo/case_8 decode n=4096 k=3840"),
 ]
 
 
@@ -317,6 +324,7 @@ def check_linear_stream_routing():
         (5, 512, 512, "prefill M=5 n=512 k=512"),
         (1, 160, 256, "M=1 but n=160 (n%64!=0)"),
         (1, 256, 250, "M=1 but k=250 (k%16!=0)"),
+        (1, 3842, 256, "M=1 but n=3842 (n%64!=0)"),
     ]
     for m, n, k, label in fallback_shapes:
         x, w = make_inputs(n, k, 77, 0.5)
@@ -356,7 +364,7 @@ def check_contract_rejection():
     ok = True
     sentinel = 7.0
     for n, k, label in ((100, 256, "n=100 (n%64!=0)"), (160, 256, "n=160 (n%64!=0)"),
-                        (256, 250, "k=250 (k%16!=0)")):
+                        (256, 250, "k=250 (k%16!=0)"), (3842, 256, "n=3842 (n%64!=0)")):
         x_bad = torch.zeros(k, dtype=torch.half)
         w_bad = torch.zeros(n, k, dtype=torch.half)
         # Sentinel: "not written" is observable as "every element is still 7.0".
