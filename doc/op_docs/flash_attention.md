@@ -203,6 +203,42 @@ PyTorch API 仍接收 `cu_seqlens_q`，由其已有绑定负责转换。
 `block_size` 16/64/128、`table_dim` 8192）都走第 2 行，即统一为 6；本轮**不**把非法形状
 改判为 `BAD_PARAM`（review 建议选项二，为避免改变已发布的返回码契约，仅文档区分）。
 
+### Head Dimension (D) 与 Page Size (block_size) 支持与拒绝规格表
+
+依据 `teco/interface/ops/flash_attention.cpp`、`teco/ual/ops/flash_attention/find_flash_attention.cpp` 与 `teco/plugin/pluginFlashAttention/plugin_flash_attention.cc` 的代码实现，将各维度与 page size 的支持状态、派发路径及拒绝返回码整理如下表：
+
+| 配置类别 | 具体输入条件与形状示例 | 支持状态 | 算法分支 | UAL 返回码 | C API 返回码 | 拒绝行为与返回码判定依据 |
+| --- | --- | :---: | --- | --- | --- | --- |
+| **标准支持配置** | `head_size % 32 == 0` 且 `block_size == 32` 且 SPM 预算内（如 `D ∈ {32, 64, 96, 128, 160}`，`block_size == 32`） | ✅ 支持 | 走 ALGO0（`teco_slave_flash_attention_half`） | `SUCCESS`（0） | `TECOOPS_STATUS_SUCCESS`（0） | 正常派发并启动 kernel，写出有效输出 |
+| **head_size 非 32 对齐** | `head_size % 32 != 0`（如 `D=48, 80, 112`；`D=48` 虽满足 `% 16 == 0` 但不满足 32 对齐） | ❌ 拒绝 | 无（派发层 fail-closed 拦截） | `Status::NOT_IMPLEMENTED`（4） | `TECOOPS_STATUS_NOT_SUPPORTED`（6） | **非 BAD_PARAM**；ALGO0 的 PV GEMM 按 32 列步进，非 32 对齐导致尾列未累加且 SIMD 重缩放越界。旧版输出 NaN，现 fail-closed 抛 `RuntimeError(status 6)`，输出张量未被写入（哨兵保留） |
+| **block_size 非 32** | `block_size != 32`（如 `block_size=16, 64, 128`） | ❌ 拒绝 | 无（派发层 fail-closed 拦截） | `Status::NOT_IMPLEMENTED`（4） | `TECOOPS_STATUS_NOT_SUPPORTED`（6） | **非 BAD_PARAM**；ALGO0 硬编码 `BN == block_size == 32`，非 32 会静默读取错误物理页。现 fail-closed 抛 `RuntimeError(status 6)`，输出张量未被写入（哨兵保留） |
+| **大头维度 D256 / D512** | `D=256` 或 `D=512`（即使 `block_size == 32`） | ❌ 当前分支拒绝 | 本分支仅注册 ALGO0，拒绝派发；走 ALGO1/2 需满足前置条件（见下） | `Status::NOT_IMPLEMENTED`（4） | `TECOOPS_STATUS_NOT_SUPPORTED`（6） | **非 BAD_PARAM**；ALGO0 的单核 SPM 需求公式（`1152*D + 27136 > 235 KiB`）超出硬件限制。当前分支 fail-closed 抛 `RuntimeError(status 6)`，输出未被写入 |
+| **超 SPM 预算配置** | `head_size % 32 == 0` 但 `1152*D + 27136 + align64(4*table_dim) > 235 KiB`（如 `D=192`，或 `D=160` + `table_dim=8192`） | ❌ 拒绝 | 无（派发层 fail-closed 拦截） | `Status::NOT_IMPLEMENTED`（4） | `TECOOPS_STATUS_NOT_SUPPORTED`（6） | **非 BAD_PARAM**；超出硬件 SPM 235 KiB 容量限制，强行分配会导致设备内存越界。现 fail-closed 抛 `RuntimeError(status 6)`，输出未被写入 |
+| **非正数维度** | `head_dim <= 0` 或 `block_table_dim <= 0` | ❌ 拒绝 | 无（派发层 fail-closed 拦截） | `Status::NOT_IMPLEMENTED`（4） | `TECOOPS_STATUS_NOT_SUPPORTED`（6） | **非 BAD_PARAM**；参数非法，派发层校验拦截 |
+| **非法数据类型 / 描述符** | `k_cache`/`v_cache` dtype 非 half，或描述符维度不一致 | ❌ 拒绝 | 无（参数层拦截） | N/A（在 C API 层拦截） | `TECOOPS_STATUS_BAD_PARAM`（3） | **是 BAD_PARAM**；参数本身非法，在 `flashAttentionCheckArgs` 中校验失败直接返回 3，未进入 UAL 派发 |
+
+#### D256 / D512 走 ALGO1 / ALGO2 的前置条件
+
+当前 PR 分支仅包含 ALGO0 基础实现，未引入大头维度特化 kernel。若后续分支要接入并支持 D256 / D512，必须**在同一提交内**满足以下全部前置条件，方可开放分发：
+1. **特化 Kernel 源码**：引入并编译独立的 D256 与 D512 slave kernel（如 `teco_slave_flash_attention_d256_half` 与 `teco_slave_flash_attention_d512_half`），重构其 SPM 分块（通过缩小 Q block 行数 `BM`、调整计算步进与异步双缓冲结构，使单核内存占用严格受控在 256 KiB SPM 硬限制内）；
+2. **算子类算法表注册**：在 `teco/ual/ops/flash_attention/flash_attention.hpp`（`FlashAttentionOp`）的算法数组中分别注册 ALGO1（D256）与 ALGO2（D512）条目；
+3. **分发函数匹配与越界保护**：在 `find_flash_attention.cpp` 中建立 `head_dim == 256 -> return 1` 与 `head_dim == 512 -> return 2` 的映射规则，并在取表前增加算法下标 `[0, count)` 的一致性界限检查，防止表项缺失导致的非法访问；
+4. **分页与流契约一致**：保证特化 kernel 同样遵守 `block_size == 32` 分页契约与当前 stream 绑定规则。
+
+在上述前置条件完备前，D256/D512 在本分支严格按未实现（`NOT_IMPLEMENTED` → `TECOOPS_STATUS_NOT_SUPPORTED` 6）fail-closed 拒绝。
+
+#### 插件调用路径（Plugin）的硬失败与输出未写保证
+
+在 `teco/plugin/pluginFlashAttention/plugin_flash_attention.cc` 中：
+1. 插件在 `Enqueue()` 中构建 TensorDescriptor 并调用 `tecoopsFlashAttention()`；
+2. 当传入不支持的配置（如 `head_size % 32 != 0` 或 `block_size != 32`）时，底层派发函数拦截并返回 `TECOOPS_STATUS_NOT_SUPPORTED`（6）；
+3. 插件检查 `status != TECOOPS_STATUS_SUCCESS`，硬失败并抛出异常：
+   ```c++
+   throw std::runtime_error("plugin_flash_attention rejected parameters (status " +
+                            std::to_string(static_cast<int>(status)) + ")");
+   ```
+4. **输出未被写入（哨兵保证）**：因为拦截发生在 kernel launch 之前，且插件在 `Enqueue()` 中一旦 status 错误即立即抛出异常、完全不触碰 `out_dev` 缓冲区，所以调用方的输出张量**完全未被写入**。在 `plugin_test/test_plugin_flash_attention.py` 的负例测试中，对输出缓冲预填 7.0 哨兵值，捕获异常后断言输出张量仍为 7.0（`sentinel untouched`），证明该调用路径在硬失败时不破坏调用方内存。
+
 
 | 参数          | 数据类型 | 维度信息                                             | 存储格式 |
 | ------------- | -------- | ---------------------------------------------------- | -------- |

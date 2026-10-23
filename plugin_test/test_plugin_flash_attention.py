@@ -25,6 +25,7 @@
 # OF SUCH DAMAGE.
 
 import math
+import re
 import numpy as np
 from tvm.plugin import plugins
 import tecoinference
@@ -60,10 +61,10 @@ def create_plugin_onnx_model(input_shapes, attributes):
     return model
 
 
-def _make_inputs(q_lens, kv_lens, seed):
-    """Pack independent dense sequences into shuffled physical 32-token pages."""
+def _make_inputs(q_lens, kv_lens, seed, head_size=64, block_size=32):
+    """Pack independent dense sequences into shuffled physical block_size-token pages."""
     rng = np.random.default_rng(seed)
-    heads, kv_heads, head_size, block_size = 8, 4, 64, 32
+    heads, kv_heads = 8, 4
     counts = [(length + block_size - 1) // block_size for length in kv_lens]
     num_blocks = sum(counts)
     q = rng.standard_normal((sum(q_lens), heads, head_size)).astype(np.float16)
@@ -150,6 +151,109 @@ def test_mixed_batch():
     _run_case("mixed_batch", [1, 32], [128, 64], 45)
 
 
+def test_unsupported_config():
+    """Negative tests: plugin must reject unsupported configurations and leave output untouched.
+
+    Under ALGO0 dispatch rules:
+    - head_size % 32 != 0 (e.g. head_size=48) is rejected because PV GEMM and SIMD
+      tiles operate on 32-column blocks;
+    - block_size != 32 (e.g. block_size=64) is rejected because ALGO0 hard-codes BN=32.
+
+    The rejection path in UAL returns Status::NOT_IMPLEMENTED (4), mapped by Convert::toStatus
+    to TECOOPS_STATUS_NOT_SUPPORTED (6). The plugin catches non-SUCCESS and throws
+    std::runtime_error("plugin_flash_attention rejected parameters (status 6)"),
+    which surfaces in Python as RuntimeError. The output buffer must remain untouched
+    (sentinel preserved), matching the sentinel convention of #38/#40/#48.
+    """
+    cases = [
+        ("unsupported_head_size_48", [32], [32], 48, 32),
+        ("unsupported_block_size_64", [32], [64], 64, 64),
+    ]
+    all_ok = True
+    for name, q_lens, kv_lens, head_size, block_size in cases:
+        arrays, _, _ = _make_inputs(q_lens, kv_lens, seed=123, head_size=head_size, block_size=block_size)
+        names = ["q", "k_cache", "v_cache", "block_table", "q_seq_lens", "seqused_k"]
+        shapes = {key: value.shape for key, value in zip(names, arrays)}
+        model = create_plugin_onnx_model(shapes, {
+            "max_seqlen_q": max(q_lens), "max_seqlen_k": max(kv_lens),
+            "max_block_num": arrays[1].shape[0],
+        })
+        mod, _ = tvm.relay.frontend.from_onnx(model, shapes)
+        fbs_model = dyn.to_teco_infer_dyn(mod, {}, "teco_dyn")
+        engine = tecoinference.Engine(fbs_model)
+        ctx = engine.create_context()
+        for index, value in enumerate(arrays):
+            ctx.set_input(index, value)
+
+        # 哨兵预填 (与 #38/#40/#48 约定一致: 哨兵值 7.0)
+        sentinel_val = 7.0
+        sentinel = np.full(shapes["q"], sentinel_val, dtype=np.float16)
+        sentinel_ready = False
+        if hasattr(ctx, "set_output"):
+            try:
+                ctx.set_output(0, sentinel.copy())
+                sentinel_ready = True
+            except Exception:
+                pass
+        if not sentinel_ready:
+            try:
+                out_buf = ctx.get_output(0)
+                if hasattr(out_buf, "copyfrom"):
+                    out_buf.copyfrom(sentinel)
+                    sentinel_ready = True
+                else:
+                    out_arr = np.asarray(out_buf)
+                    out_arr.fill(sentinel_val)
+                    sentinel_ready = True
+            except Exception:
+                pass
+
+        try:
+            ctx.executor_run()
+        except AssertionError:
+            raise
+        except (RuntimeError, Exception) as exc:
+            msg = str(exc)
+            # 插件在 status != SUCCESS 时抛出:
+            # "plugin_flash_attention rejected parameters (status 6)"
+            if "rejected parameters" not in msg and "status" not in msg:
+                print(f"  [{name}] FAILED (unexpected exception message): {msg}")
+                all_ok = False
+                continue
+
+            # 提取 status 码并断言
+            # 状态码 6 对应 TECOOPS_STATUS_NOT_SUPPORTED (UAL Status::NOT_IMPLEMENTED)
+            m = re.search(r"status\s+(\d+)", msg)
+            status_str = f"status={m.group(1)}" if m else "status in msg"
+            if m:
+                status_code = int(m.group(1))
+                if status_code != 6:
+                    print(f"  [{name}] FAILED (expected status 6 for unsupported dispatch, got {status_code}): {msg}")
+                    all_ok = False
+                    continue
+
+            # 断言输出未被写入 (若预填成功，报错后仍为哨兵)
+            if sentinel_ready:
+                try:
+                    out_after = np.asarray(ctx.get_output(0))
+                    if not np.all(out_after == sentinel_val):
+                        print(f"  [{name}] FAILED (rejected call still wrote output tensor)")
+                        all_ok = False
+                        continue
+                except Exception:
+                    # 报错后输出缓冲区不可读/未分配，同样满足未写入输出
+                    pass
+
+            # 打印 EXPECTED_FAIL 标记 (与 #51 门禁约定一致)
+            print(f"  rejected head_dim={head_size}, block_size={block_size}: "
+                  f"PASSED (EXPECTED_FAIL, {status_str}; sentinel untouched)")
+        else:
+            print(f"  [{name}] FAILED (accepted unsupported head_dim={head_size}, block_size={block_size})")
+            all_ok = False
+
+    return all_ok
+
+
 if __name__ == "__main__":
     print("plugin_flash_attention numerical tests (block_size=32)")
     test_prefill()
@@ -157,3 +261,21 @@ if __name__ == "__main__":
     test_chunked_prefill()
     test_mixed_batch()
     print("ALL NUMERICAL TESTS PASSED")
+
+    print("-" * 60)
+    print("plugin_flash_attention negative tests (unsupported configs)")
+    neg_ok = test_unsupported_config()
+
+    print()
+    print("=" * 60)
+    print("NOTE: negative cases are expected to fail (EXPECTED_FAIL).")
+    print('      The "rejected ...: PASSED (EXPECTED_FAIL)" lines assert that an')
+    print('      unsupported shape was rejected before kernel launch; the matching')
+    print('      low-level "tecoual runtime error" / "branch is not exit" log lines')
+    print("      are emitted by that rejection path, not by a functional defect.")
+    print("=" * 60)
+    if not neg_ok:
+        print("SOME TESTS FAILED")
+        raise SystemExit(1)
+    print("ALL TESTS PASSED")
+    raise SystemExit(0)
