@@ -57,6 +57,7 @@ def flash_attn_varlen_func_ref(
     """CPU 参考: flash_attn_varlen_func
 
     与 test/zoo/teco/flash_attention/flash_attention.py 中的实现一致。
+    支持 q_seq_lens[i] == 0 的 batch（vLLM cudagraph padding 形态，对应 batch 输出 0 行且直接跳过计算）。
     """
     _, num_heads, head_size = q.shape
     _, block_size, num_kv_heads, _ = k_cache.shape
@@ -75,6 +76,9 @@ def flash_attn_varlen_func_ref(
         L = int(q_seq_lens[i])
         S = int(kv_seq_lens[i])
 
+        if L == 0:
+            continue
+
         block_ids = block_table[i, :cdiv(S, block_size)].to(torch.long)
         k_ = k_cache.index_select(0, block_ids).reshape(-1, num_kv_heads, head_size)[:S]
         v_ = v_cache.index_select(0, block_ids).reshape(-1, num_kv_heads, head_size)[:S]
@@ -87,7 +91,7 @@ def flash_attn_varlen_func_ref(
         # Causal mask
         attn_bias = torch.zeros(L, S, dtype=q.dtype, device=q.device)
         if causal:
-            attn_mask = torch.ones(S, S, dtype=torch.bool, device=q.device).tril(diagonal=0).logical_not()[-L:]
+            attn_mask = torch.ones(L, S, dtype=torch.bool, device=q.device).tril(diagonal=S - L).logical_not()
             attn_bias = attn_bias.masked_fill_(attn_mask, float("-inf"))
 
         # Q: [L, num_heads, head_size] -> [num_heads, L, head_size]
