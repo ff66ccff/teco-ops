@@ -505,7 +505,7 @@ __device__ __always_inline void flash_attention_half(FlashAttentionArgs args) {
                     simd_store(zv, outc + idx);
                 }
             }
-
+    
             // Causal KV-tile bound.  The causal mask below is applied unconditionally and a
             // tile whose whole column range is masked out contributes exp(-inf) = 0 to l and 0
             // to o while leaving m unchanged, so the online-softmax state after it is
@@ -567,40 +567,22 @@ __device__ __always_inline void flash_attention_half(FlashAttentionArgs args) {
                 // the online-softmax state unchanged.
                 // ---------------------------------------------------------------
                 if constexpr (BM == 128) {
-                    // Async double-pane score GEMM pipeline: overlap panel pb+1 compute/store
-                    // with panel pb vector softmax. Two 16 KB panes fit inside 32 KB qbuf.
-                    float *cst0 = (float *)qbuf;
-                    float *cst1 = (float *)qbuf + (128 * 32);
+                    float *cst = (float *)qbuf;          // [128, 32] float panel scratch
                     const int npb = (cur_BM + 31) >> 5;  // live 32-query panels
                     auto tA = make_tensor<2>((half *)ktmp_cur,
                         {static_cast<size_t>(cur_BN), static_cast<size_t>(BK)});
                     MatmulConfig matmul_cfg;
                     Matmul matmul(matmul_cfg);
-                    if (npb > 0) {
-                        auto tB0 = make_tensor<2>((half *)kbuf,
-                            {static_cast<size_t>(BK), static_cast<size_t>(32)});
-                        auto tST0 = make_tensor<2>(cst0,
-                            {static_cast<size_t>(cur_BN), static_cast<size_t>(32)});
-                        matmul.compute_async<MatmulBlockConfig::M128_N32>(
-                            tA, tB0, /*is_lastk=*/true);
-                        matmul.storeC_spm_async(tST0);
-                    }
                     for (int pb = 0; pb < npb; pb++) {
                         const int r0 = pb << 5;
-                        float *pane = ((pb & 1) == 0) ? cst0 : cst1;
-                        float *nxt  = ((pb & 1) == 0) ? cst1 : cst0;
+                        auto tB = make_tensor<2>((half *)(kbuf + pb * (BK * 32)),
+                            {static_cast<size_t>(BK), static_cast<size_t>(32)});
+                        auto tST = make_tensor<2>((float *)cst,
+                            {static_cast<size_t>(cur_BN), static_cast<size_t>(32)});
+                        matmul.compute_async<MatmulBlockConfig::M128_N32>(
+                            tA, tB, /*is_lastk=*/true);
+                        matmul.storeC_spm_async(tST);
                         matmul.wait_storeC(1);
-
-                        // Look one panel ahead: issue panel pb+1 on alternate pane
-                        if (pb + 1 < npb) {
-                            auto tB_nxt = make_tensor<2>((half *)(kbuf + (pb + 1) * (BK * 32)),
-                                {static_cast<size_t>(BK), static_cast<size_t>(32)});
-                            auto tST_nxt = make_tensor<2>(nxt,
-                                {static_cast<size_t>(cur_BN), static_cast<size_t>(32)});
-                            matmul.compute_async<MatmulBlockConfig::M128_N32>(
-                                tA, tB_nxt, /*is_lastk=*/true);
-                            matmul.storeC_spm_async(tST_nxt);
-                        }
 
                         // simd mul softmax_scale (a panel row is 32 contiguous queries)
                         {
@@ -608,9 +590,9 @@ __device__ __always_inline void flash_attention_half(FlashAttentionArgs args) {
                             int total = cur_BN * 32;
                             for (int si = 0; si < total; si += 16) {
                                 floatv16 v;
-                                simd_load(v, pane + si);
+                                simd_load(v, cst + si);
                                 v = simd_mul(v, vscale);
-                                simd_store(v, pane + si);
+                                simd_store(v, cst + si);
                             }
                         }
 
@@ -627,13 +609,13 @@ __device__ __always_inline void flash_attention_half(FlashAttentionArgs args) {
                                 if (rmax > cur_BM - 1) rmax = cur_BM - 1;
                                 if (rmax < r0) continue;   // no masked query inside this panel
                                 int hi = (r0 + 31 < rmax) ? 31 : rmax - r0;
-                                fill_inf(pane + t * 32, hi + 1);
+                                fill_inf(cst + t * 32, hi + 1);
                             }
                         }
 
                         // Step A: online softmax on the transposed panel (bit-identical state);
                         // it also emits P into p_score, so no separate transpose loop follows.
-                        online_softmax_panel_T(pane, r0, cur_BM, cur_BN,
+                        online_softmax_panel_T(cst, r0, cur_BM, cur_BN,
                                                m_ptr, l_ptr, m_next, l_next, scale,
                                                p_score, BN, off);
 
@@ -1123,3 +1105,5 @@ __device__ __always_inline void flash_attention_half(FlashAttentionArgs args) {
 __global__ void teco_slave_flash_attention_half(FlashAttentionArgs args) {
     flash_attention_half<128>(args);
 }
+
+
