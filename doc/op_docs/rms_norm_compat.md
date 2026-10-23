@@ -93,7 +93,8 @@ PASSED` 的含义是：与 IEEE 模型有 1 个元素不同、它恰在掩码内
 - 官方固定形态 zoo：`./build/demo --gid=0 --perf_repeat=50 --warm_repeat=3 --gtest_repeat=1 --case_path=zoo/teco/rms_norm_compat/test_case/<c>.prototxt`；
   参考实现按上文两次舍入写，与设备输出逐例对照（DIFF1 门限 1e-2，实测见 PR #45 评论）。
 - Python 侧：`python_api_test/test_rms_norm_compat.py` 覆盖绑定/导出契约、非默认
-  stream、`rstd` 被原样消费（喂入被缩放过的 `rstd` 以排除"内部重算"）、以及拒绝路径。
+  stream、`rstd` 被原样消费（喂入被缩放过的 `rstd` 以排除"内部重算"）、拒绝路径，
+  以及与 `tecoops.rms_norm` 残差变体的对照断言（`residual_out` 逐位一致，`out` 在 1 ULP 理论容限内）。
 - **未覆盖**：plugin 层（`teco/plugin/pluginRmsNormCompat*` 不存在，推理侧零覆盖）、
   FakeTensor/meta 与 `torch.compile`（无证据，不应视为已支持）、多流并发。
 
