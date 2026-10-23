@@ -24,6 +24,17 @@
 # WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY
 # OF SUCH DAMAGE.
 
+"""Plugin 测试: flash_attention.
+
+Contract Note:
+    All attributes registered for this plugin (see ATTR_TYPES / plugin_flash_attentionAttrs)
+    must appear in the ONNX node attributes. TVM's get_relay_func
+    (tvm/plugin/plugin_register.py) iterates over all registered attribute names
+    and accesses attrs[key] without falling back to default values.
+    To avoid KeyError, create_plugin_onnx_model provides default attribute values
+    (has_softmax_scale=0, softmax_scale=0.0) for any omitted optional attributes.
+"""
+
 import math
 import numpy as np
 from tvm.plugin import plugins
@@ -33,20 +44,44 @@ from onnx import helper, TensorProto
 import tvm
 from tvm import relay
 
+# Attr types registered for plugin_flash_attention in TVM.
+# All attributes must match plugin_flash_attentionAttrs in C++.
+ATTR_TYPES = {
+    "max_seqlen_q": "int",
+    "max_seqlen_k": "int",
+    "max_block_num": "int",
+    "has_softmax_scale": "int",
+    "softmax_scale": "float",
+}
+
+# Default attributes provided when constructing the ONNX node.
+# Legacy path: has_softmax_scale=0, softmax_scale=0.0 (kernel keeps default 1/sqrt(head_size)).
+# Note: ONNX attribute types must match registered types (int and float, not str).
+DEFAULT_ATTRS = {
+    "has_softmax_scale": 0,
+    "softmax_scale": 0.0,
+}
+
 # Register op once at module level
 try:
     plugins.register_op(
         op_name="plugin_flash_attention",
         inputs=["q", "k_cache", "v_cache", "block_table", "cu_seqlens_q", "seqused_k"],
-        attrs={"max_seqlen_q": "int", "max_seqlen_k": "int", "max_block_num": "int",
-               "has_softmax_scale": "int", "softmax_scale": "float"}
+        attrs=ATTR_TYPES,
     )
 except AssertionError:
     pass  # already registered
 
 
-def create_plugin_onnx_model(input_shapes, attributes):
-    """Build ONNX model with plugin_flash_attention node."""
+def create_plugin_onnx_model(input_shapes, attributes=None):
+    """Build ONNX model with plugin_flash_attention node.
+
+    Note:
+        All registered plugin attributes must appear in the ONNX node attributes because
+        TVM get_relay_func indexes attrs[key] without falling back to defaults.
+        DEFAULT_ATTRS supplies default values (has_softmax_scale=0, softmax_scale=0.0),
+        which callers can override via attributes.
+    """
     input_names = list(input_shapes.keys())
     inputs = []
     for name, shape in input_shapes.items():
@@ -54,11 +89,15 @@ def create_plugin_onnx_model(input_shapes, attributes):
         inputs.append(helper.make_tensor_value_info(name, dtype, shape))
     output = helper.make_tensor_value_info("output", TensorProto.FLOAT16, input_shapes["q"])
 
+    node_attrs = dict(DEFAULT_ATTRS)
+    if attributes:
+        node_attrs.update(attributes)
+
     node = helper.make_node(
         "plugin_flash_attention",
         input_names,
         ["output"],
-        **attributes,
+        **node_attrs,
         domain="my_custom_ops",
         version=1
     )

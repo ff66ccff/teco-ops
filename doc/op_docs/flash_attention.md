@@ -119,6 +119,13 @@ Python pybind 的完整位置参数 ABI 不变，调用方仍应显式提供 sca
 对拍（同一组张量运行两次必须得到不同输出），并断言两次输出都有限，构成 explicit-scale 通路
 真的生效的数值门禁。
 
+**plugin 属性与 ONNX 构造契约**：TVM 插件机制（`tvm/plugin/plugin_register.py` 中的 `get_relay_func`）
+在解析 ONNX 节点时，会遍历插件注册的全部属性名并在 ONNX 节点属性字典中取值（`attrs[key]`），
+不会回落到 C++ 注册的默认值。因此 ONNX 构造侧必须保证所有已注册属性（`max_seqlen_q`、`max_seqlen_k`、
+`max_block_num`、`has_softmax_scale`、`softmax_scale`）均出现在 ONNX 节点的属性中。
+测试中的 `create_plugin_onnx_model` 统一提供 `has_softmax_scale=0`（int）与 `softmax_scale=0.0`（float）默认值，
+既有调用点无需逐一改动即可构造合法 ONNX 节点，调用方显式指定时以传入值为准。
+
 ### 参数信息
 
 tecoopsFlashAttention参数信息
