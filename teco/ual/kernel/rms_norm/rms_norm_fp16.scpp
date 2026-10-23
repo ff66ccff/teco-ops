@@ -51,6 +51,10 @@ using namespace tecoops::ual::args;  // NOLINT
 using namespace teco::hal;            // NOLINT
 using namespace sdaa;                 // NOLINT
 
+__device__ __always_inline size_t align_up(size_t val, size_t alignment) {
+    return (val + alignment - 1) & ~(alignment - 1);
+}
+
 // H2a: shared RMSNorm second-pass epilogue (widened input -> two ordered fp32 multiplies ->
 // narrow).  Extracted from the accepted inline bodies verbatim so that the only change in this
 // attempt is the first-pass row-level pipelining.
@@ -132,14 +136,15 @@ __global__ void teco_slave_rms_norm_fp16(RmsNormArgs args) {
     // H2a: two rows in flight -> two input pairs resident (4 rows) so the next pair's HBM
     // prefetch can be issued before the current pair's reduce.
     const size_t row_bytes = static_cast<size_t>(D) * sizeof(half);
-    half *spm_base = static_cast<half *>(rt_spm_malloc(row_bytes * 7));
-    half *in0   = spm_base;
-    half *in1   = in0 + D;
-    half *in2   = in1 + D;
-    half *in3   = in2 + D;
-    half *out0  = in3 + D;
-    half *out1  = out0 + D;
-    half *weight = out1 + D;
+    const size_t seg = align_up(row_bytes, 64) / sizeof(half);
+    half *spm_base = static_cast<half *>(rt_spm_malloc(seg * 7 * sizeof(half)));
+    half *in0    = spm_base;
+    half *in1    = spm_base + 1 * seg;
+    half *in2    = spm_base + 2 * seg;
+    half *in3    = spm_base + 3 * seg;
+    half *out0   = spm_base + 4 * seg;
+    half *out1   = spm_base + 5 * seg;
+    half *weight = spm_base + 6 * seg;
     half *inbuf[4] = {in0, in1, in2, in3};
     half *outbuf[2] = {out0, out1};
 
@@ -284,18 +289,19 @@ __global__ void teco_slave_rms_norm_fp16_add(RmsNormArgs args) {
     // Step 3: SPM 分配 (in[0..3] / res[0..3] / out0 / out1 / weight)
     // H2a: two rows in flight -> two (input, residual) pairs resident.
     const size_t row_bytes = static_cast<size_t>(D) * sizeof(half);
-    half *spm_base = static_cast<half *>(rt_spm_malloc(row_bytes * 11));
+    const size_t seg = align_up(row_bytes, 64) / sizeof(half);
+    half *spm_base = static_cast<half *>(rt_spm_malloc(seg * 11 * sizeof(half)));
     half *in0    = spm_base;
-    half *in1    = in0 + D;
-    half *in2    = in1 + D;
-    half *in3    = in2 + D;
-    half *res0   = in3 + D;
-    half *res1   = res0 + D;
-    half *res2   = res1 + D;
-    half *res3   = res2 + D;
-    half *out0   = res3 + D;
-    half *out1   = out0 + D;
-    half *weight = out1 + D;
+    half *in1    = spm_base + 1 * seg;
+    half *in2    = spm_base + 2 * seg;
+    half *in3    = spm_base + 3 * seg;
+    half *res0   = spm_base + 4 * seg;
+    half *res1   = spm_base + 5 * seg;
+    half *res2   = spm_base + 6 * seg;
+    half *res3   = spm_base + 7 * seg;
+    half *out0   = spm_base + 8 * seg;
+    half *out1   = spm_base + 9 * seg;
+    half *weight = spm_base + 10 * seg;
     half *inbuf[4]  = {in0, in1, in2, in3};
     half *resbuf[4] = {res0, res1, res2, res3};
     half *outbuf[2] = {out0, out1};
