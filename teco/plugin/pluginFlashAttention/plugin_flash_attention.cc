@@ -82,7 +82,7 @@ class PluginFlashAttentionImpl : public AbstractPluginOp {
     void* k_cache_dev = ctx->GetInputDataPtr("k_cache");
     void* v_cache_dev = ctx->GetInputDataPtr("v_cache");
     void* block_table_dev = ctx->GetInputDataPtr("block_table");
-    void* cu_seqlens_q_dev = ctx->GetInputDataPtr("cu_seqlens_q");
+    void* q_seq_lens_dev = ctx->GetInputDataPtr("q_seq_lens");
     void* seqused_k_dev = ctx->GetInputDataPtr("seqused_k");
     void* out_dev = ctx->GetOutputDataPtr(0);
 
@@ -105,9 +105,24 @@ class PluginFlashAttentionImpl : public AbstractPluginOp {
     }
 
     std::vector<int> q_shape, k_cache_shape, v_cache_shape, bt_shape;
+    std::vector<int> q_lens_shape, kv_lens_shape;
     ctx->GetInputShape("q", q_shape);           // [total_tokens, num_heads, head_size]
     ctx->GetInputShape("k_cache", k_cache_shape); // [num_blocks, kv_heads, block_size, head_size]
-    (void)v_cache_shape;
+    ctx->GetInputShape("block_table", bt_shape); // [batch_size, block_table_dim]
+    ctx->GetInputShape("v_cache", v_cache_shape);
+    ctx->GetInputShape("q_seq_lens", q_lens_shape);
+    ctx->GetInputShape("seqused_k", kv_lens_shape);
+    if (q_shape.size() != 3 || k_cache_shape.size() != 4 ||
+        v_cache_shape != k_cache_shape || bt_shape.size() != 2 ||
+        bt_shape[0] <= 0 || bt_shape[1] <= 0 ||
+        q_lens_shape != std::vector<int>{bt_shape[0]} ||
+        kv_lens_shape != std::vector<int>{bt_shape[0]} ||
+        q_shape[0] <= 0 || q_shape[1] <= 0 || q_shape[2] <= 0 ||
+        k_cache_shape[0] <= 0 || k_cache_shape[1] <= 0 || k_cache_shape[2] <= 0 ||
+        q_shape[2] != k_cache_shape[3] || q_shape[1] % k_cache_shape[1] != 0) {
+      throw std::runtime_error("plugin_flash_attention: incompatible input shapes; "
+                               "q_seq_lens and seqused_k must be [batch_size]");
+    }
 
     sdaaStream_t stream = ctx->GetStream();
 
@@ -136,7 +151,7 @@ class PluginFlashAttentionImpl : public AbstractPluginOp {
       status = tecoopsFlashAttentionWithScale(
           handle, static_cast<int>(max_seqlen_q), static_cast<int>(max_seqlen_k),
           static_cast<int>(max_block_num), static_cast<float>(softmax_scale),
-          static_cast<const int*>(cu_seqlens_q_dev),
+          static_cast<const int*>(q_seq_lens_dev),
           static_cast<const int*>(seqused_k_dev),
           blockTableDesc, static_cast<const void*>(block_table_dev),
           qDataDesc, static_cast<const void*>(q_dev),
@@ -148,7 +163,7 @@ class PluginFlashAttentionImpl : public AbstractPluginOp {
       status = tecoopsFlashAttention(
           handle, static_cast<int>(max_seqlen_q), static_cast<int>(max_seqlen_k),
           static_cast<int>(max_block_num),
-          static_cast<const int*>(cu_seqlens_q_dev),
+          static_cast<const int*>(q_seq_lens_dev),
           static_cast<const int*>(seqused_k_dev),
           blockTableDesc, static_cast<const void*>(block_table_dev),
           qDataDesc, static_cast<const void*>(q_dev),
@@ -187,9 +202,9 @@ PLUGIN_REGISTER_OP("plugin_flash_attention")
     .Input("block_table")
     .Type("Tensor")
     .Desc("Block table: [batch_size, block_table_dim]")
-    .Input("cu_seqlens_q")
+    .Input("q_seq_lens")
     .Type("Tensor")
-    .Desc("Cumulative Q seq lens: [batch_size + 1]")
+    .Desc("Q seq lengths per batch, not cumulative: [batch_size]")
     .Input("seqused_k")
     .Type("Tensor")
     .Desc("KV seq used per batch: [batch_size]")

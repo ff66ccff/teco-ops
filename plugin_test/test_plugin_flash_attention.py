@@ -66,7 +66,7 @@ DEFAULT_ATTRS = {
 try:
     plugins.register_op(
         op_name="plugin_flash_attention",
-        inputs=["q", "k_cache", "v_cache", "block_table", "cu_seqlens_q", "seqused_k"],
+        inputs=["q", "k_cache", "v_cache", "block_table", "q_seq_lens", "seqused_k"],
         attrs=ATTR_TYPES,
     )
 except AssertionError:
@@ -85,7 +85,7 @@ def create_plugin_onnx_model(input_shapes, attributes=None):
     input_names = list(input_shapes.keys())
     inputs = []
     for name, shape in input_shapes.items():
-        dtype = TensorProto.INT32 if name in ("block_table", "cu_seqlens_q", "seqused_k") else TensorProto.FLOAT16
+        dtype = TensorProto.INT32 if name in ("block_table", "q_seq_lens", "seqused_k") else TensorProto.FLOAT16
         inputs.append(helper.make_tensor_value_info(name, dtype, shape))
     output = helper.make_tensor_value_info("output", TensorProto.FLOAT16, input_shapes["q"])
 
@@ -107,7 +107,33 @@ def create_plugin_onnx_model(input_shapes, attributes=None):
     return model
 
 
-def check_output(name, out, expected_shape):
+def reference_attention(q, kc, vc, bt, q_lens, kv_lens, scale):
+    """Independent fp32 paged causal attention, including explicit scale=0."""
+    result = np.empty(q.shape, dtype=np.float32)
+    offset = 0
+    block_size = kc.shape[2]
+    groups = q.shape[1] // kc.shape[1]
+    for b, length in enumerate(q_lens):
+        length, used = int(length), int(kv_lens[b])
+        if length == 0:
+            continue
+        pages = bt[b, :(used + block_size - 1) // block_size]
+        key = kc[pages].transpose(0, 2, 1, 3).reshape(-1, kc.shape[1], q.shape[2])[:used]
+        value = vc[pages].transpose(0, 2, 1, 3).reshape(-1, vc.shape[1], q.shape[2])[:used]
+        key = np.repeat(key.astype(np.float32), groups, axis=1).transpose(1, 2, 0)
+        value = np.repeat(value.astype(np.float32), groups, axis=1).transpose(1, 0, 2)
+        query = q[offset:offset + length].astype(np.float32).transpose(1, 0, 2)
+        score = (query @ key) * scale
+        visible = np.arange(used)[None, :] <= (used - length + np.arange(length))[:, None]
+        score = np.where(visible[None], score, -np.inf)
+        probability = np.exp(score - score.max(axis=-1, keepdims=True))
+        probability /= probability.sum(axis=-1, keepdims=True)
+        result[offset:offset + length] = (probability @ value).transpose(1, 0, 2)
+        offset += length
+    return result
+
+
+def check_output(name, out, expected_shape, reference):
     """Assert the plugin produced a real, finite, non-degenerate result.
 
     The plugin Enqueue() discards the tecoopsFlashAttention() return status, so a
@@ -121,7 +147,8 @@ def check_output(name, out, expected_shape):
     values = np.asarray(out, dtype=np.float32)
     assert np.isfinite(values).all(), f"{name}: non-finite values in output"
     assert values.std() > 0.0, f"{name}: output is constant, kernel likely did not run"
-    print(f"OK (shape={out.shape}, finite, non-constant)")
+    np.testing.assert_allclose(values, reference, atol=2e-3, rtol=1e-2, err_msg=name)
+    print(f"OK (shape={out.shape}, max_error={np.max(np.abs(values - reference)):.6e})")
 
 
 def test_prefill():
@@ -135,18 +162,18 @@ def test_prefill():
     q = np.random.randn(L, H, HS).astype(np.float16)
     kc = np.random.randn(blk, KV, BS, HS).astype(np.float16)
     vc = np.random.randn(blk, KV, BS, HS).astype(np.float16)
-    bt = np.zeros((1, blk), dtype=np.int32)
-    cu = np.array([0, L], dtype=np.int32)
+    bt = np.arange(blk, dtype=np.int32).reshape(1, blk)
+    cu = np.array([L], dtype=np.int32)
     sq = np.array([S], dtype=np.int32)
 
     model = create_plugin_onnx_model(
         {"q": (L, H, HS), "k_cache": (blk, KV, BS, HS), "v_cache": (blk, KV, BS, HS),
-         "block_table": (1, blk), "cu_seqlens_q": (2,), "seqused_k": (1,)},
+         "block_table": (1, blk), "q_seq_lens": (1,), "seqused_k": (1,)},
         {"max_seqlen_q": L, "max_seqlen_k": S, "max_block_num": blk}
     )
     mod, params = tvm.relay.frontend.from_onnx(
         model, {"q": (L, H, HS), "k_cache": (blk, KV, BS, HS), "v_cache": (blk, KV, BS, HS),
-                "block_table": (1, blk), "cu_seqlens_q": (2,), "seqused_k": (1,)})
+                "block_table": (1, blk), "q_seq_lens": (1,), "seqused_k": (1,)})
     fbs_model = dyn.to_teco_infer_dyn(mod, {}, "teco_dyn")
     engine = tecoinference.Engine(fbs_model)
     ctx = engine.create_context()
@@ -159,7 +186,8 @@ def test_prefill():
     ctx.set_input(5, sq)
     ctx.executor_run()
     out = ctx.get_output(0)
-    check_output("prefill", out, (L, H, HS))
+    check_output("prefill", out, (L, H, HS),
+                 reference_attention(q, kc, vc, bt, cu, sq, 1.0 / math.sqrt(HS)))
 
 
 def test_decode():
@@ -177,18 +205,18 @@ def test_decode():
     q = np.random.randn(L, H, HS).astype(np.float16)
     kc = np.random.randn(blk, KV, BS, HS).astype(np.float16)
     vc = np.random.randn(blk, KV, BS, HS).astype(np.float16)
-    bt = np.zeros((1, blk), dtype=np.int32)
-    cu = np.array([0, L], dtype=np.int32)
+    bt = np.arange(blk, dtype=np.int32).reshape(1, blk)
+    cu = np.array([L], dtype=np.int32)
     sq = np.array([S], dtype=np.int32)
 
     model = create_plugin_onnx_model(
         {"q": (L, H, HS), "k_cache": (blk, KV, BS, HS), "v_cache": (blk, KV, BS, HS),
-         "block_table": (1, blk), "cu_seqlens_q": (2,), "seqused_k": (1,)},
+         "block_table": (1, blk), "q_seq_lens": (1,), "seqused_k": (1,)},
         {"max_seqlen_q": L, "max_seqlen_k": S, "max_block_num": blk}
     )
     mod, params = tvm.relay.frontend.from_onnx(
         model, {"q": (L, H, HS), "k_cache": (blk, KV, BS, HS), "v_cache": (blk, KV, BS, HS),
-                "block_table": (1, blk), "cu_seqlens_q": (2,), "seqused_k": (1,)})
+                "block_table": (1, blk), "q_seq_lens": (1,), "seqused_k": (1,)})
     fbs_model = dyn.to_teco_infer_dyn(mod, {}, "teco_dyn")
     engine = tecoinference.Engine(fbs_model)
     ctx = engine.create_context()
@@ -201,7 +229,8 @@ def test_decode():
     ctx.set_input(5, sq)
     ctx.executor_run()
     out = ctx.get_output(0)
-    check_output("decode", out, (L, H, HS))
+    check_output("decode", out, (L, H, HS),
+                 reference_attention(q, kc, vc, bt, cu, sq, 1.0 / math.sqrt(HS)))
 
 
 def test_chunked_prefill():
@@ -217,18 +246,18 @@ def test_chunked_prefill():
     q = np.random.randn(L, H, HS).astype(np.float16)
     kc = np.random.randn(blk, KV, BS, HS).astype(np.float16)
     vc = np.random.randn(blk, KV, BS, HS).astype(np.float16)
-    bt = np.zeros((1, blk), dtype=np.int32)
-    cu = np.array([0, L], dtype=np.int32)
+    bt = np.arange(blk, dtype=np.int32).reshape(1, blk)
+    cu = np.array([L], dtype=np.int32)
     sq = np.array([S], dtype=np.int32)
 
     model = create_plugin_onnx_model(
         {"q": (L, H, HS), "k_cache": (blk, KV, BS, HS), "v_cache": (blk, KV, BS, HS),
-         "block_table": (1, blk), "cu_seqlens_q": (2,), "seqused_k": (1,)},
+         "block_table": (1, blk), "q_seq_lens": (1,), "seqused_k": (1,)},
         {"max_seqlen_q": L, "max_seqlen_k": S, "max_block_num": blk}
     )
     mod, params = tvm.relay.frontend.from_onnx(
         model, {"q": (L, H, HS), "k_cache": (blk, KV, BS, HS), "v_cache": (blk, KV, BS, HS),
-                "block_table": (1, blk), "cu_seqlens_q": (2,), "seqused_k": (1,)})
+                "block_table": (1, blk), "q_seq_lens": (1,), "seqused_k": (1,)})
     fbs_model = dyn.to_teco_infer_dyn(mod, {}, "teco_dyn")
     engine = tecoinference.Engine(fbs_model)
     ctx = engine.create_context()
@@ -241,7 +270,8 @@ def test_chunked_prefill():
     ctx.set_input(5, sq)
     ctx.executor_run()
     out = ctx.get_output(0)
-    check_output("chunked prefill", out, (L, H, HS))
+    check_output("chunked prefill", out, (L, H, HS),
+                 reference_attention(q, kc, vc, bt, cu, sq, 1.0 / math.sqrt(HS)))
 
 
 def test_explicit_scale():
@@ -262,13 +292,13 @@ def test_explicit_scale():
     q = np.random.randn(L, H, HS).astype(np.float16)
     kc = np.random.randn(blk, KV, BS, HS).astype(np.float16)
     vc = np.random.randn(blk, KV, BS, HS).astype(np.float16)
-    bt = np.zeros((1, blk), dtype=np.int32)
-    cu = np.array([0, L], dtype=np.int32)
+    bt = np.arange(blk, dtype=np.int32).reshape(1, blk)
+    cu = np.array([L], dtype=np.int32)
     sq = np.array([S], dtype=np.int32)
 
     shapes = {"q": (L, H, HS), "k_cache": (blk, KV, BS, HS),
               "v_cache": (blk, KV, BS, HS), "block_table": (1, blk),
-              "cu_seqlens_q": (2,), "seqused_k": (1,)}
+              "q_seq_lens": (1,), "seqused_k": (1,)}
     base = {"max_seqlen_q": L, "max_seqlen_k": S, "max_block_num": blk}
 
     def run(extra_attrs):
@@ -290,6 +320,11 @@ def test_explicit_scale():
     default_out = run({})
     scaled_out = run({"has_softmax_scale": 1, "softmax_scale": 0.0})
     assert np.isfinite(default_out).all() and np.isfinite(scaled_out).all()
+    np.testing.assert_allclose(default_out,
+        reference_attention(q, kc, vc, bt, cu, sq, 1.0 / math.sqrt(HS)),
+        atol=2e-3, rtol=1e-2)
+    np.testing.assert_allclose(scaled_out,
+        reference_attention(q, kc, vc, bt, cu, sq, 0.0), atol=2e-3, rtol=1e-2)
     delta = float(np.abs(default_out - scaled_out).max())
     assert delta > 1e-2, f"explicit softmax_scale was ignored (max abs diff {delta})"
     print(f"OK (explicit-scale path active, max abs diff {delta:.4f})")
