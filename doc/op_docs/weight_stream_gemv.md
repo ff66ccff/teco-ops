@@ -286,7 +286,7 @@ tecoopsDestroy(handle);
 
 连同 `case_2..case_5` 的契约边界（`n = 64/128/192`、`k = 48/2032`），zoo 现在覆盖
 `n % 64 == 0`、`k % 16 == 0` 的主要取值组合，以及 `xspm32` 的 `k % 32 == 16` 分支。
-其余三个模型的 decode shape 需各自跑一次同口径 census 后再补；本 PR 不跨模型臆造 shape。
+上述为历史 zoo 覆盖；四模型独立 census 与全部真实 shape 的 Python API 回归已于 2026-10-24 补齐，见本文末节。
 ## 设备实测（c50，官方固定形态）
 
 测量环境：SCU SDAA 单卡（TECO_AICARD_01 / SDAADriver 3.2.0 / SDAARuntime 3.2.0），
@@ -318,3 +318,36 @@ tecoopsDestroy(handle);
 修复是在两次 carve 之间把游标重新对齐到 64 B（入口期指针运算，不引入热路径分支）；
 提交 `2e48f83`。这也把此前 review 里“宿主只校验 `k % 16 == 0`、而 `xspm32` 可能非 64 B 对齐”
 的建议项闭环为**实测缺陷 + 修复**。
+
+## 四模型真实 decode shape 回归（2026-10-24）
+
+本轮对 Gemma-4-12B-it、MiniCPM5-1B、Hy-MT2-1.8B、InternVL3_5-8B 分别运行
+诊断 M=1 census；[合并输入](../validation/20261024/weight-stream-gemv-census.json)
+保留每条观察的模型、层、原始 summary 来源及各模型构建元数据。22 条观察对应 22 个
+唯一 `(n, k)`（含四模型完整 LMHead），其中 3 个与默认用例重合；默认 12 例增加 19 例后，
+共 **31 cases、295 PASS、0 failure，进程退出码 0**。
+[完整数值与路由结果](../validation/20261024/weight-stream-gemv-conformance.json)
+记录 CPU fp32/fp64 参考、设备 GEMV、`linear_stream` 路由与 bias、非法形状拒绝，
+以及信息性的 GEMV/GEMM 舍入差异。容差沿用原测试；输入为按真实 shape 生成的确定性随机
+fp16 张量，未读取模型权重。本轮只主张正确性与覆盖，不主张性能提升或模型 token parity。
+
+验证使用 `/home/py312/bin/python`（解析为 `/usr/local/python/bin/python3.12`）及合并团队
+算子包，构建测试源码为 `db1597e1265a5fc3e24207b793c9d1dd94327a24`；**未独立重建
+standalone PR44**。已核对 PR44 测试提交 `c3e7c6e` 与该构建源码、团队提交 `4b46b97`
+的 `weight_stream_gemv` kernel、interface、args、ops 七个文件，均无差异；此源码一致性
+不等于其它算子或设备镜像布局一致。
+
+- core SHA-256：`531e0caf206a3c580e03f87965d067e44c0d88f8740a06a3d20abd88377574dc`
+- extension SHA-256：`82aa5455938789bc0009f85a947edfa271918a9d0b115866ad7f70bb57fbbf41`
+
+安装同一合并包并设置其 `PYTHONPATH` / `LD_LIBRARY_PATH` 后，在仓库根目录复现：
+
+```bash
+flock -x /root/gpu-slot/fix-20261024.lock /home/py312/bin/python \
+  python_api_test/test_weight_stream_gemv.py \
+  --census doc/validation/20261024/weight-stream-gemv-census.json \
+  --output-json /tmp/weight-stream-gemv-conformance.json
+```
+
+原实测命令依次传入四个模型 summary（PR3→PR6）；合并文件按同序保留各行，生成的
+31 个 case、随机种子与原测试一致。无 `--census` 时仍运行原默认用例。
