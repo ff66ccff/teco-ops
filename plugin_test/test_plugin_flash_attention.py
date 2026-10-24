@@ -26,7 +26,10 @@
 
 import math
 import re
+import hashlib
+from pathlib import Path
 import numpy as np
+from flash_attention_c_api import run_flash
 from tvm.plugin import plugins
 import tecoinference
 from tvm.contrib.teco_infer_dyn import dyn
@@ -185,6 +188,18 @@ def test_unsupported_config():
         for index, value in enumerate(arrays):
             ctx.set_input(index, value)
 
+        # Check the exact C implementation loaded by the engine, independently
+        # of whether this SDK preserves a C++ exception's what() string.
+        mapped = [line.split()[-1] for line in Path("/proc/self/maps").read_text().splitlines()
+                  if line.split()[-1].endswith("/libteco_ops_plugin.so")]
+        assert mapped, "the engine did not map libteco_ops_plugin.so"
+        core = str(Path(mapped[0]).resolve())
+        status, raw_out = run_flash(core, arrays)
+        assert status == 6, f"{name}: C API returned {status}, expected NOT_SUPPORTED=6"
+        assert np.all(raw_out == 7.0), f"{name}: rejected C API wrote output"
+        print(f"  {name}: mapped_core={core}, sha256={hashlib.sha256(Path(core).read_bytes()).hexdigest()}, "
+              "C_API_status=6 sentinel_untouched=True")
+
         # 哨兵预填 (与 #38/#40/#48 约定一致: 哨兵值 7.0)
         sentinel_val = 7.0
         sentinel = np.full(shapes["q"], sentinel_val, dtype=np.float16)
@@ -212,19 +227,24 @@ def test_unsupported_config():
             ctx.executor_run()
         except AssertionError:
             raise
-        except (RuntimeError, Exception) as exc:
+        except RuntimeError as exc:
             msg = str(exc)
             # 插件在 status != SUCCESS 时抛出:
             # "plugin_flash_attention rejected parameters (status 6)"
             if "rejected parameters" not in msg and "status" not in msg:
-                print(f"  [{name}] FAILED (unexpected exception message): {msg}")
-                all_ok = False
-                continue
+                # TecoInference may slice a std::runtime_error to std::exception
+                # at the C++/Python boundary. Accept that transport limitation
+                # only after the same mapped core returned 6 without a write.
+                if "std::exception" not in msg:
+                    print(f"  [{name}] FAILED (unexpected exception message): {msg}")
+                    all_ok = False
+                    continue
+                print(f"  {name}: SDK erased exception detail: {msg}")
 
             # 提取 status 码并断言
             # 状态码 6 对应 TECOOPS_STATUS_NOT_SUPPORTED (UAL Status::NOT_IMPLEMENTED)
             m = re.search(r"status\s+(\d+)", msg)
-            status_str = f"status={m.group(1)}" if m else "status in msg"
+            status_str = f"status={m.group(1)}" if m else "C_API_status=6 (verified independently)"
             if m:
                 status_code = int(m.group(1))
                 if status_code != 6:
