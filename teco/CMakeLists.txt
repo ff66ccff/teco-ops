@@ -84,10 +84,11 @@ file(GLOB_RECURSE SRC_UAL_KERNEL "${OPS_DIR}/ual/kernel/*/*.scpp")
 #
 # Merge prerequisites.  The TUs used as anchors below come from other open PRs and must land first:
 # weight_stream_gemv (#44), zzz_flash_attention_d128 (#41), z_reshape_and_cache_dma (#35),
-# z_ms_deform_attn_forward_span and zz_ms_deform_attn_backward_ha (#40).  rotary_embedding and
-# rms_norm_compat are not part of any open PR yet, so the TAX-1 and A3 moves stay inert until they
-# land.  Every lookup is existence-guarded: a missing anchor skips its move silently, which is why the
-# fingerprint of the final list is printed below.
+# z_ms_deform_attn_forward_span and zz_ms_deform_attn_backward_ha (#40), rotary_embedding (#48),
+# and rms_norm_compat (#45). Merge this layout PR after those kernel PRs and #52; then rebuild,
+# remeasure absolute device addresses, and refresh the merged-tree fingerprint. Every lookup is
+# existence-guarded: absent anchors leave their moves inert. A standalone-tree fingerprint is not
+# evidence for the final merged layout. See doc/device_section_order.md for the rebaseline steps.
 option(TECO_ENABLE_DEVICE_SECTION_ORDER "Pin the measured device-section order at link time (build-time only)" ON)
 # Opt-in CI gate: with this ON a fingerprint mismatch fails the configure step instead of
 # printing a WARNING.  Default OFF so a plain developer build never breaks on a stale pin,

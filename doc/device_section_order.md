@@ -177,11 +177,26 @@ from the rest of the glob order and are therefore allowed to shift with unrelate
    (`weight_stream_gemv/weight_stream_gemv.scpp`, `rotary_embedding/rotary_embedding_fp16.scpp`,
    `zzz_flash_attention_d128/zzz_flash_attention_d128.scpp`) is present in `SRC_UAL_KERNEL` and
    preserves the calibrated relative order (`weight_stream_gemv` < `rotary_embedding` <
-   `zzz_flash_attention_d128`). A missing anchor or inverted relative position triggers a
-   `FATAL_ERROR` at configure time. Exemption channel: pass
-   `-DTECO_OPS_DEVICE_SECTION_ORDER_ASSERT=OFF` to exempt the check on unmerged/intermediate
-   trees where anchor TUs have not landed, or `-DTECO_ENABLE_DEVICE_SECTION_ORDER=OFF` to disable
-   device-section ordering entirely.
+   `zzz_flash_attention_d128`). An absent anchor is reported as STATUS and skipped; an inverted
+   relative position among the present anchors triggers `FATAL_ERROR`. A passing partial-tree
+   assertion does not certify absent anchors. Exemption channel: pass
+   `-DTECO_OPS_DEVICE_SECTION_ORDER_ASSERT=OFF` to exempt the relative-order assertion, or
+   `-DTECO_ENABLE_DEVICE_SECTION_ORDER=OFF` to disable device-section ordering entirely.
+
+### Merge checklist and fingerprint refresh
+
+Land the kernel owners #35/#40/#41/#44/#45/#48 and the reduction changes #52 before
+closing the merged-tree layout. In particular, rotary is #48 and RMSNorm compat is #45;
+neither is a missing, unsubmitted operator. Keep this PR's independent fingerprint as its
+own receipt; do not reuse it as the merged tree's expected value.
+
+On the complete merged tree, build once with STRICT disabled to read the candidate order,
+record the absolute device section `(name,address,size)` table, and run all original fixed
+cases with correctness and three timing repetitions. Repeat any claimed layout benefit in
+a second window. Only then set `TECO_OPS_DEVICE_SECTION_ORDER_EXPECTED_FP` to that measured
+tree's fingerprint and reconfigure with STRICT enabled. A source-size change requires new
+address measurements even if the TU-order fingerprint is unchanged. Do not add `list(SORT)`
+or padding kernels to repair a mismatch.
 
 ## Propagating the pin to other operators
 
