@@ -251,3 +251,31 @@ DMA 提交；当前 DMA head 的官方 CI/完整 wheel、官方模型环境和�
 | --- | --- | --- | --- |
 | D=513 / D=515 | 设备报 ILLEGAL_ADDRESS 崩溃 (`rc=134 SDAA_ERROR_ILLEGAL_ADDRESS`) | 拦截并拒绝 (`TECOOPS_STATUS_BAD_PARAM` / Python `RuntimeError`) | 奇数 hidden size 导致 2 字节行长，违背 SDAA DMA 4 字节粒度 |
 | D=514 / D=516 / D=520 | 崩溃 | 通过 (OK, max_err ~1e-3, res_err=0) | 偶数 hidden size 满足 4 字节粒度，64B SPM 段步长吸收尾部 padding |
+
+## 当前对齐修复的构建溯源与回归入口
+
+下面指纹对应 `748ad13c57eca4bdc9c773bd697d446297aa2809` 的独立构建，
+不能与上方 2026-10-07/08 的历史 SIMD/DMA 实验混用；后续只改文档或测例
+不会改变这个源码内核，但重新构建仍应记录新的产物指纹与映射路径。
+
+| 产物 | SHA-256 |
+| --- | --- |
+| `rms_norm_fp16.scpp`（Git LF 内容） | `1e46f892f3e817055059c1f9fec1db571fbf51e0bdd0ccd8f1fa6fde4abca977` |
+| core `libteco_ops.so` | `1d799c32cca4ca175c3baa4e9a8dea80c6c672ba1ce8b5e84e37c4d47ad076bc` |
+| Python `_torch_ext` | `95a01e231296c73910b6ff780cc7b45927180e548c3ca811bc34a8d108122e08` |
+| wheel | `07a000ede2bf41f6ecee7bbccdd1d806e282d757a35c95bc522c44e382983cde` |
+
+构建目录为 `/root/tmpwork/c51/pr37/src`，安装到其 `install/tecoops/`；
+复核时必须同时检查 `/proc/self/maps` 中的实际 core/extension 路径，
+不能仅凭 `tecoops.__file__` 或“API 存在”判断使用了本次库。
+当前源码的 Git blob 为 `0c147b5b0b1339c567eedba67f987ba7bef45923`，
+用于消除 Windows CRLF checkout 与 Linux LF 文件的字节差异歧义。
+
+新增回归 `case_8` 是 `N=7,D=514` 的 plain 路径；`case_9` 是
+`N=7,D=520` 的 residual/add 路径，专门覆盖偶数非 32 倍数的行宽。
+它们追加到 zoo，不替换或改写原 `case_0..7` 固定性能测例。
+奇数 `D=513` 不启动设备 kernel，由 `python_api_test/test_rms_norm.py`
+的负例检查入口拒绝和输出哨兵未写，不能以会崩溃的设备 launch 测拒绝契约。
+
+模型级 greedy32 与 5–10 分钟稳态按各模型自己的源码、shape、安装指纹
+分别留痕；上方历史证明或另一模型的通过结果不能替代当前修复的验证。
