@@ -52,6 +52,13 @@ Run exactly as CI runs it::
 ``--cpu-only`` skips every device step and is only a sanity path for the oracle
 (it needs TORCH_DEVICE_BACKEND_AUTOLOAD=0 off-device); it is never what CI
 exercises.
+
+Repeat ``--census path/to/decode-shapes.json`` to also exercise observed model
+decode geometries.  Each input must be the JSON summary with ``model`` and
+``rows`` fields produced by the diagnostic decode census.  Unique (n, k) pairs
+are added to every existing numerical/routing check, with all source model and
+layer observations retained in the JSON report.  The original cases, seeds,
+input distributions, and tolerances remain unchanged.
 """
 import argparse
 import json
@@ -186,6 +193,49 @@ CASES = [
     (3840, 4096, 63, 0.50, "zoo/case_7 decode n=3840 k=4096"),
     (4096, 3840, 65, 0.50, "zoo/case_8 decode n=4096 k=3840"),
 ]
+
+
+def load_census_cases(paths):
+    """Validate observed fp16 M=1 rows and extend CASES once per geometry."""
+    by_shape = {(n, k): label for n, k, _, _, label in CASES}
+    observed = {}
+    for path in paths:
+        source = os.path.abspath(os.path.expanduser(path))
+        with open(source, encoding="utf-8") as handle:
+            data = json.load(handle)
+        if not isinstance(data, dict) or not isinstance(data.get("model"), str) or not data["model"].strip():
+            raise ValueError("%s: expected a nonempty model name" % source)
+        rows = data.get("rows")
+        if not isinstance(rows, list) or not rows:
+            raise ValueError("%s: expected a nonempty rows list" % source)
+        for index, row in enumerate(rows):
+            location = "%s: rows[%d]" % (source, index)
+            if not isinstance(row, dict) or row.get("dtype") != "torch.float16":
+                raise ValueError("%s: expected torch.float16 dtype" % location)
+            x_shape, w_shape = row.get("input_shape"), row.get("weight_shape")
+            if any(not isinstance(shape, list) or len(shape) != 2 or
+                   any(type(dim) is not int or dim <= 0 for dim in shape)
+                   for shape in (x_shape, w_shape)):
+                raise ValueError("%s: expected positive two-dimensional input/weight shapes" % location)
+            n, k = w_shape
+            if x_shape != [1, k]:
+                raise ValueError("%s: expected input [1, k] matching weight [n, k]" % location)
+            if row.get("weight_stride") != [k, 1]:
+                raise ValueError("%s: expected contiguous weight stride [k, 1]" % location)
+            if n % 64 or k % 16:
+                raise ValueError("%s: observed geometry misses the GEMV n%%64/k%%16 contract" % location)
+            shape = (n, k)
+            if shape not in by_shape:
+                label = "census decode n=%d k=%d" % shape
+                # New cases use the same deterministic half-input generator and
+                # bound as the existing decode cases.  Existing seeds stay fixed.
+                CASES.append((n, k, 1000 + len(observed), 0.50, label))
+                by_shape[shape] = label
+            evidence = dict(source=source, model=data["model"], row_index=index,
+                            observation=row)
+            observed.setdefault(shape, []).append(evidence)
+    return [dict(n=n, k=k, case=by_shape[(n, k)], provenance=provenance)
+            for (n, k), provenance in observed.items()]
 
 
 def check_binding():
@@ -459,11 +509,25 @@ def main():
                         help="run only the oracle self-check; no device work")
     parser.add_argument("--output-json",
                         help="write the report here instead of a temporary directory")
+    parser.add_argument("--census", action="append", default=[], metavar="JSON",
+                        help="append observed fp16 M=1 decode shapes from a census summary; repeatable")
     args = parser.parse_args()
+    try:
+        census_shapes = load_census_cases(args.census)
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
 
     print("=" * 72)
     print("weight_stream_gemv / linear_stream python-API conformance test")
     print("=" * 72)
+    if census_shapes:
+        print("Census: %d input(s), %d observed row(s), %d unique shape(s); %d total test cases"
+              % (len(args.census), sum(len(item["provenance"]) for item in census_shapes),
+                 len(census_shapes), len(CASES)), flush=True)
+        for item in census_shapes:
+            print("  n=%d k=%d: %s" % (item["n"], item["k"], ", ".join(
+                "%s/%s" % (entry["model"], entry["observation"].get("layer", "unknown"))
+                for entry in item["provenance"])), flush=True)
 
     ok = check_binding()
     ok = check_cpu_oracle() and ok
@@ -484,6 +548,8 @@ def main():
     report = dict(operator="weight_stream_gemv", passed=bool(ok and not FAILURES),
                   tol_ulps=TOL_ULPS, tol_abs_floor=TOL_ABS_FLOOR,
                   failures=FAILURES, results=REPORT)
+    if census_shapes:
+        report["census_shapes"] = census_shapes
     serialized = json.dumps(report, indent=2) + "\n"
     if args.output_json:
         path = os.path.abspath(os.path.expanduser(args.output_json))
