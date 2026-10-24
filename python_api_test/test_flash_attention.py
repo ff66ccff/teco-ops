@@ -398,6 +398,29 @@ def test_zero_length_padded_batch():
     return all_ok
 
 
+def test_negative_short_cu_seqlens():
+    """Reject short cumulative metadata before slicing or touching output."""
+    q_lens, kv_lens = [1, 2], [32, 64]
+    q, kc, vc, bt = _make_random_fa_inputs(q_lens, kv_lens, 8, 4, 128, 32)
+    q, kc, vc, bt = (x.contiguous().to("sdaa") for x in (q, kc, vc, bt))
+    used = torch.tensor(kv_lens, dtype=torch.int32, device="sdaa")
+    for values in ([], [0], [0, 1]):
+        out = torch.full_like(q, 7.0)
+        cu = torch.tensor(values, dtype=torch.int32, device="sdaa")
+        try:
+            tecoops.flash_attn_varlen_func(
+                q, kc, vc, 2, cu, 64, torch.empty(0), used,
+                1.0 / math.sqrt(128), True, torch.empty(0), bt, False, out)
+        except RuntimeError as exc:
+            if "at least batch_size + 1" not in str(exc):
+                raise AssertionError(f"unexpected metadata error: {exc}") from exc
+            assert torch.equal(out.cpu(), torch.full_like(out.cpu(), 7.0))
+            print(f"  [negative_short_cu_{len(values)}] PASSED (sentinel untouched)")
+        else:
+            raise AssertionError("short cu_seqlens_q was accepted")
+    return True
+
+
 def test_negative_host_cu_seqlens():
     """负例: 主机端 cu_seqlens_q 必须报错, 而不是被静默当作设备地址解释
 
@@ -480,6 +503,7 @@ if __name__ == "__main__":
         ("test_multi_batch",  test_multi_batch),
         ("test_zero_length_padded_batch",  test_zero_length_padded_batch),
         ("test_negative_host_cu_seqlens",  test_negative_host_cu_seqlens),
+        ("test_negative_short_cu_seqlens", test_negative_short_cu_seqlens),
     ]
 
     all_passed = True

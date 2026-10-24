@@ -142,6 +142,11 @@ void flash_attn_varlen_func_torch(
     TORCH_CHECK(cu_seqlens_q.device() == q.device(),
                 "flash_attn_varlen_func: cu_seqlens_q must reside on the same "
                 "device as q (", q.device(), "), got ", cu_seqlens_q.device());
+    TORCH_CHECK(cu_seqlens_q.dim() == 1 &&
+                cu_seqlens_q.numel() >= static_cast<int64_t>(batch_size) + 1,
+                "flash_attn_varlen_func: cu_seqlens_q must be a 1-D tensor with "
+                "at least batch_size + 1 elements (", batch_size + 1,
+                "); got shape ", cu_seqlens_q.sizes());
     // cu_seqlens_k is part of the historical ABI but is NOT dereferenced by the
     // kernel: the KV lengths come from seqused_k (device side) instead.  It is
     // therefore deliberately not validated -- existing callers (including the
